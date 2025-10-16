@@ -1,0 +1,24 @@
+{
+    "gopls": {
+        "diagnosticsDelay": "0s",
+        "analyses": {
+            "nilness": false,
+            "shadow": false,
+            "unusedparams": false,
+            "unusedwrite": false,
+            "unusedvariable": false
+        },
+        "staticcheck": false,
+        "ui.semanticTokens": true,
+    },
+    // "workbench.colorCustomizations": {
+    //     "editorError.background": "#00ff7b10",
+    //     "editorError.foreground": "#00000000"
+    // }
+    "[go]": {
+        "editor.formatOnSave": false,
+        "editor.codeActionsOnSave": {
+            "source.organizeImports": "never"
+        }
+    },
+}
