@@ -18,7 +18,7 @@ type taskT struct {
 }
 
 type assignT struct {
-	wid int // worker id
+	wid int // worker id, 唯一标识任务的一次执行
 	task taskT
 }
 
@@ -52,6 +52,8 @@ type Coordinator struct {
 	assignQ chan assignT
 	startQ chan startT
 	doneQ chan doneT
+	
+	wakeCh chan int
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -166,6 +168,8 @@ func (c *Coordinator) handleMapDone(mapOutput []string) {
 
 func (c *Coordinator) handleReduceDone(reduceOutput string, tid int) {
 	c.nReduceDone ++
+	
+	// 重命名为正式输出
 	os.Rename(reduceOutput, fmt.Sprintf("mr-out-%v", tid))
 	
 	if c.nReduceDone == c.nReduce {
@@ -177,14 +181,9 @@ func (c *Coordinator) handleCrash(task taskT) {
 	c.assignQ <- makeAssign(task)
 }
 
-func (c *Coordinator) handleTimeout() {
-	for wid, started := range c.inflight {
-		// 如果任务started超过10s还在c.inflight中，则认为这个worker崩溃了
-		if time.Since(started.startTime) >= TTL {
-			c.handleCrash(started.assigned.task)
-			delete(c.inflight, wid) // go 保证边遍历边删除合法
-		}
-	}
+func (c *Coordinator) startTimer(wid int, duration time.Duration) {
+	time.Sleep(duration)
+	c.wakeCh <- wid
 }
 
 func (c *Coordinator) master() {
@@ -195,18 +194,19 @@ func (c *Coordinator) master() {
 	for{
 		select{
 		case started := <-c.startQ:
-			c.inflight[started.assigned.wid] = started
+			wid := started.assigned.wid
+			c.inflight[wid] = started
+			go c.startTimer(wid, TTL)
 
 		case done := <-c.doneQ:
-			tid := -1
-			for wid, started := range c.inflight {
-				if wid == done.wid {
-					tid = started.assigned.task.tid
-					delete(c.inflight, wid)
-					break
-				}
+			started, exist := c.inflight[done.wid]
+			if !exist {
+				// 这个任务已经超时，或者被本来判定为超时的任务抢先完成
+				// 抛弃这个任务
+				break
 			}
-			if tid == -1 { break }
+			tid := started.assigned.task.tid
+			delete(c.inflight, done.wid)
 
 			switch done.kind {
 			case "map":
@@ -215,9 +215,13 @@ func (c *Coordinator) master() {
 				c.handleReduceDone(done.reduceOutput, tid)
 			}
 
-		default:
-			time.Sleep(100 * time.Millisecond)
-			c.handleTimeout()
+		case wid := <-c.wakeCh:
+			started, exist := c.inflight[wid]
+			if exist {
+				// 这个任务在inflight中超过10s，认为崩溃
+				delete(c.inflight, wid)
+				c.handleCrash(started.assigned.task)
+			}
 		}
 	}
 }
