@@ -42,7 +42,6 @@ type Coordinator struct {
 	nReduce int
 	nMapDone int
 	nReduceDone int
-	mapDone bool
 	doneCh chan bool
 
 	mapTasks []taskT
@@ -167,15 +166,37 @@ func (c *Coordinator) handleMapDone(mapOutput []string) {
 	for i, file := range mapOutput {
 		c.reduceTasks[i].reduceInput = append(c.reduceTasks[i].reduceInput, file)
 	}
+	
+	if c.nMapDone == c.nMap {
+		for _, task := range c.reduceTasks {
+			c.assignQ <- makeAssign(task)
+		}
+	}
 }
 
 func (c *Coordinator) handleReduceDone(reduceOutput string, tid int) {
 	c.nReduceDone ++
 	os.Rename(reduceOutput, fmt.Sprintf("mr-out-%v", tid))
+	
+	if c.nReduceDone == c.nReduce {
+		c.doneCh <- true
+	}
 }
 
 func (c *Coordinator) handleCrash(task taskT) {
 	c.assignQ <- makeAssign(task)
+}
+
+func (c *Coordinator) handleTimeout() {
+	for i := 0; i < len(c.inflight); i ++ {
+		started := c.inflight[i]
+		// 如果任务started超过10s还在c.inflight中，则认为这个worker崩溃了
+		if time.Since(started.startTime) >= TTL {
+			c.handleCrash(started.assigned.task)
+			c.inflight = remove(c.inflight, i)
+			i --
+		}
+	}
 }
 
 
@@ -208,30 +229,8 @@ func (c *Coordinator) master() {
 			}
 
 		default:
-			if c.nMapDone == c.nMap {
-				if !c.mapDone {
-					c.mapDone = true
-					for _, task := range c.reduceTasks {
-						c.assignQ <- makeAssign(task)
-					}
-				}
-
-				if c.nReduceDone == c.nReduce {
-					c.doneCh <- true
-					return
-				}
-			}
-			// 此处可以sleep一段时间？多久？
-			// time.Sleep(time.Second / 5)
-			for i := 0; i < len(c.inflight); i ++ {
-				started := c.inflight[i]
-				// 如果任务started超过10s还在c.inflight中，则认为这个worker崩溃了
-				if time.Since(started.startTime) >= TTL {
-					c.handleCrash(started.assigned.task)
-					c.inflight = remove(c.inflight, i)
-					i --
-				}
-			}
+			time.Sleep(100 * time.Millisecond)
+			c.handleTimeout()
 		}
 	}
 }
