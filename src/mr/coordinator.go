@@ -47,7 +47,7 @@ type Coordinator struct {
 	mapTasks []taskT
 	reduceTasks []taskT
 	
-	inflight []startT // in-flight tasks
+	inflight map[int]startT // in-flight tasks: wid -> started task
 
 	assignQ chan assignT
 	startQ chan startT
@@ -151,16 +151,6 @@ func makeStart(assigned assignT) (started startT) {
 	return
 }
 
-// 不保持顺序地删除index处的元素，线性复杂度
-func remove[T any](slice []T, index int) []T {
-    if index < 0 || index >= len(slice) {
-        return slice
-    }
-    
-    slice[index] = slice[len(slice)-1]
-    return slice[:len(slice)-1]
-}
-
 func (c *Coordinator) handleMapDone(mapOutput []string) {
 	c.nMapDone ++
 	for i, file := range mapOutput {
@@ -188,17 +178,14 @@ func (c *Coordinator) handleCrash(task taskT) {
 }
 
 func (c *Coordinator) handleTimeout() {
-	for i := 0; i < len(c.inflight); i ++ {
-		started := c.inflight[i]
+	for wid, started := range c.inflight {
 		// 如果任务started超过10s还在c.inflight中，则认为这个worker崩溃了
 		if time.Since(started.startTime) >= TTL {
 			c.handleCrash(started.assigned.task)
-			c.inflight = remove(c.inflight, i)
-			i --
+			delete(c.inflight, wid) // go 保证边遍历边删除合法
 		}
 	}
 }
-
 
 func (c *Coordinator) master() {
 	for _, task := range c.mapTasks {
@@ -208,14 +195,14 @@ func (c *Coordinator) master() {
 	for{
 		select{
 		case started := <-c.startQ:
-			c.inflight = append(c.inflight, started)
+			c.inflight[started.assigned.wid] = started
 
 		case done := <-c.doneQ:
 			tid := -1
-			for i, started := range c.inflight {
-				if started.assigned.wid == done.wid {
+			for wid, started := range c.inflight {
+				if wid == done.wid {
 					tid = started.assigned.task.tid
-					c.inflight = remove(c.inflight, i)
+					delete(c.inflight, wid)
 					break
 				}
 			}
