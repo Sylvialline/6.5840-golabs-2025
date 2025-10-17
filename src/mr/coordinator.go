@@ -236,7 +236,7 @@ func (c *Coordinator) master() {
 	}
 }
 
-// rpc handlers
+// rpc types and handlers
 
 type Empty struct{}
 type RequestReply struct{
