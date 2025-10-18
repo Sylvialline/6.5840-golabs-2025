@@ -8,6 +8,8 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
+
+	kvsrv "6.5840/kvsrv1"
 )
 
 //
@@ -38,6 +40,7 @@ func callRequest() (reply RequestReply) {
 	ok := call("Coordinator.RequestTask", &Empty{}, &reply)
 	if !ok {
 		// 认为coordinator已经正常退出
+		kvsrv.DPrintf("yay")
 		os.Exit(0)
 	}
 	return
@@ -134,9 +137,9 @@ func handleReduce(wid int, reduceInput []string,
 		log.Fatalf("handleReduce: create create: %v", reduceOutput)
 	}
 	
-	for _, kvsa := range intermediate {
-		output := reducef(kvsa.Key, kvsa.Values)
-		fmt.Fprintf(ofile, "%v %v\n", kvsa.Key, output)
+	for _, kvs := range intermediate {
+		output := reducef(kvs.Key, kvs.Values)
+		fmt.Fprintf(ofile, "%v %v\n", kvs.Key, output)
 	}
 
 	return
@@ -155,12 +158,15 @@ func Worker(mapf func(string, string) []KeyValue,
 			Wid: reply.Wid,
 			Kind: reply.Kind,
 		}
+		kvsrv.DPrintf("Worker#%v: %v\n", args.Wid, args.Kind)
 
 		switch reply.Kind {
 		case "map":
 			args.MapOutput = handleMap(reply.Wid, reply.NReduce, reply.MapInput, mapf)
+			kvsrv.DPrintf("Worker#%v:\nMapInput: %#v\nMapOutput: %#v\n\n", args.Wid, reply.MapInput, args.MapOutput)
 		case "reduce":
 			args.ReduceOutput = handleReduce(reply.Wid, reply.ReduceInput, reducef)
+			kvsrv.DPrintf("Worker#%v:\nReduceInput: %#v\nReduceOutput: %#v\n\n", args.Wid, reply.ReduceInput, args.ReduceOutput)
 		}
 
 		callComplete(&args)

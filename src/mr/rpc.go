@@ -24,6 +24,53 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+type Empty struct{}
+type RequestReply struct{
+	Wid int
+	Kind string
+	MapInput string
+	NReduce int
+	ReduceInput []string
+}
+type CompleteArgs struct{
+	Wid int
+	Kind string
+	MapOutput []string
+	ReduceOutput string
+}
+
+func (c *Coordinator) RequestTask(empty *Empty, reply *RequestReply) error {
+	assigned := <- c.assignQ
+	reply.Wid = assigned.wid
+	reply.Kind = assigned.task.kind
+
+	switch reply.Kind {
+	case "map":
+		reply.MapInput = assigned.task.mapInput
+		reply.NReduce = c.nReduce
+	case "reduce":
+		reply.ReduceInput = assigned.task.reduceInput
+	}
+
+	c.startQ <- makeStart(assigned)
+	return nil
+}
+
+func (c *Coordinator) CompleteTask(args *CompleteArgs, empty *Empty) error {
+	done := doneT{}
+	done.wid = args.Wid
+	done.kind = args.Kind
+	
+	switch done.kind {
+	case "map":
+		done.mapOutput = args.MapOutput
+	case "reduce":
+		done.reduceOutput = args.ReduceOutput
+	}
+
+	c.doneQ <- done
+	return nil
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

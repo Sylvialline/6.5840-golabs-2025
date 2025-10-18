@@ -8,7 +8,11 @@ import (
 	"net/rpc"
 	"os"
 	"time"
+
+	kvsrv "6.5840/kvsrv1"
 )
+
+const MAX_CHANNEL_SIZE = 100
 
 type taskT struct {
 	kind string // in {"map", "reduce"}
@@ -123,14 +127,19 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	// init c.reduceTasks
 	c.reduceTasks = make([]taskT, nReduce)
-	for i, task := range c.reduceTasks {
-		task.kind = "reduce"
-		task.tid = i
+	for i := range c.reduceTasks {
+		c.reduceTasks[i].kind = "reduce"
+		c.reduceTasks[i].tid = i
 	}
 
-	c.assignQ = make(chan assignT)
-	c.startQ = make(chan startT)
-	c.doneQ = make(chan doneT)
+	c.assignQ = make(chan assignT, MAX_CHANNEL_SIZE)
+	c.startQ = make(chan startT, MAX_CHANNEL_SIZE)
+	c.doneQ = make(chan doneT, MAX_CHANNEL_SIZE)
+
+	c.doneCh = make(chan bool, 1)
+	c.wakeCh = make(chan int, MAX_CHANNEL_SIZE)
+
+	c.inflight = map[int]startT{}
 
 	go c.master()
 
@@ -168,7 +177,7 @@ func (c *Coordinator) handleMapDone(mapOutput []string) {
 
 func (c *Coordinator) handleReduceDone(reduceOutput string, tid int) {
 	c.nReduceDone ++
-	
+
 	// 重命名为正式输出
 	os.Rename(reduceOutput, fmt.Sprintf("mr-out-%v", tid))
 	
@@ -187,18 +196,22 @@ func (c *Coordinator) startTimer(wid int, duration time.Duration) {
 }
 
 func (c *Coordinator) master() {
+	kvsrv.DPrintf("master start")
 	for _, task := range c.mapTasks {
+		// kvsrv.DPrintf("%v\n", task)
 		c.assignQ <- makeAssign(task)
 	}
-
+	kvsrv.DPrintf("master for-select")
 	for{
 		select{
 		case started := <-c.startQ:
+			kvsrv.DPrintf("master case started")
 			wid := started.assigned.wid
 			c.inflight[wid] = started
 			go c.startTimer(wid, TTL)
 
 		case done := <-c.doneQ:
+			kvsrv.DPrintf("master case done")
 			started, exist := c.inflight[done.wid]
 			if !exist {
 				// 这个任务已经超时，或者被本来判定为超时的任务抢先完成
@@ -216,6 +229,7 @@ func (c *Coordinator) master() {
 			}
 
 		case wid := <-c.wakeCh:
+			kvsrv.DPrintf("master case wid")
 			started, exist := c.inflight[wid]
 			if exist {
 				// 这个任务在inflight中超过10s，认为崩溃
@@ -224,54 +238,4 @@ func (c *Coordinator) master() {
 			}
 		}
 	}
-}
-
-// rpc types and handlers
-
-type Empty struct{}
-type RequestReply struct{
-	Wid int
-	Kind string
-	MapInput string
-	NReduce int
-	ReduceInput []string
-}
-type CompleteArgs struct{
-	Wid int
-	Kind string
-	MapOutput []string
-	ReduceOutput string
-}
-
-func (c *Coordinator) RequestTask(empty *Empty, reply *RequestReply) error {
-	assigned := <- c.assignQ
-	reply.Wid = assigned.wid
-	reply.Kind = assigned.task.kind
-
-	switch reply.Kind {
-	case "map":
-		reply.MapInput = assigned.task.mapInput
-		reply.NReduce = c.nReduce
-	case "reduce":
-		reply.ReduceInput = assigned.task.reduceInput
-	}
-
-	c.startQ <- makeStart(assigned)
-	return nil
-}
-
-func (c *Coordinator) CompleteTask(args *CompleteArgs, empty *Empty) error {
-	done := doneT{}
-	done.wid = args.Wid
-	done.kind = args.Kind
-	
-	switch done.kind {
-	case "map":
-		done.mapOutput = args.MapOutput
-	case "reduce":
-		done.reduceOutput = args.ReduceOutput
-	}
-
-	c.doneQ <- done
-	return nil
 }
