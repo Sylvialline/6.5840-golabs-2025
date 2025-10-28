@@ -196,22 +196,17 @@ func (c *Coordinator) startTimer(wid int, duration time.Duration) {
 }
 
 func (c *Coordinator) master() {
-	kvsrv.DPrintf("master start")
 	for _, task := range c.mapTasks {
-		// kvsrv.DPrintf("%v\n", task)
 		c.assignQ <- makeAssign(task)
 	}
-	kvsrv.DPrintf("master for-select")
 	for{
 		select{
 		case started := <-c.startQ:
-			kvsrv.DPrintf("master case started")
 			wid := started.assigned.wid
 			c.inflight[wid] = started
 			go c.startTimer(wid, TTL)
 
 		case done := <-c.doneQ:
-			kvsrv.DPrintf("master case done")
 			started, exist := c.inflight[done.wid]
 			if !exist {
 				// 这个任务已经超时，或者被本来判定为超时的任务抢先完成
@@ -229,7 +224,6 @@ func (c *Coordinator) master() {
 			}
 
 		case wid := <-c.wakeCh:
-			kvsrv.DPrintf("master case wid")
 			started, exist := c.inflight[wid]
 			if exist {
 				// 这个任务在inflight中超过10s，认为崩溃

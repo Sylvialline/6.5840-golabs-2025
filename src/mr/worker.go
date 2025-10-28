@@ -40,7 +40,6 @@ func callRequest() (reply RequestReply) {
 	ok := call("Coordinator.RequestTask", &Empty{}, &reply)
 	if !ok {
 		// 认为coordinator已经正常退出
-		kvsrv.DPrintf("yay")
 		os.Exit(0)
 	}
 	return
