@@ -1,6 +1,8 @@
 package kvsrv
 
 import (
+	"time"
+
 	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
 	"6.5840/tester1"
@@ -17,6 +19,8 @@ func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 	// You may add code here.
 	return ck
 }
+
+const RESEND = 100 * time.Millisecond
 
 // Get fetches the current value and version for a key.  It returns
 // ErrNoKey if the key does not exist. It keeps trying forever in the
@@ -39,6 +43,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 		if ok {
 			return reply.Value, reply.Version, reply.Err
 		}
+		time.Sleep(RESEND)
 	}
 }
 
@@ -78,5 +83,6 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 			return reply.Err
 		}
 		first = false
+		time.Sleep(RESEND)
 	}
 }
