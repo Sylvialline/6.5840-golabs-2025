@@ -83,9 +83,7 @@ type Raft struct {
 	
 	// not protected by mu
 	n           int // number of peers
-	candidateCh chan termT
-	followerCh  chan termT
-	killCh      chan struct{}
+	candidateCh chan termT // buffer size = 1 makes the most sense
 
 	// protected by mu
 	state RaftState
@@ -171,8 +169,8 @@ type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
 	Term termT
 	CandidateId idT
-	LastLogIndex indexT
-	LastLogTerm termT
+	// LastLogIndex indexT
+	// LastLogTerm termT
 }
 
 // RequestVote RPC reply structure.
@@ -185,6 +183,21 @@ type RequestVoteReply struct {
 // RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.toFollower(args.Term, true)
+	}
+	reply.Term = rf.currentTerm
+	if rf.votedFor == -1 {
+		rf.votedFor = args.CandidateId
+		reply.VoteGranted = true
+	}
 }
 
 // RequestVote RPC sender.
@@ -204,16 +217,23 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	// 3A
 	Term termT
-	Success bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term > rf.currentTerm {
+		rf.toFollower(args.Term, true)
+	}
+	reply.Term = rf.currentTerm
 }
 
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if ok && reply.Term > args.Term {
+		rf.toFollower(reply.Term, false)
+	}
 	return ok
 }
 
@@ -294,9 +314,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// wait for new elections
 	go rf.toCandidate()
 
-	// wait for request of becoming follower
-	go rf.toFollower()
-
 	return rf
 }
 
@@ -307,12 +324,15 @@ func (rf *Raft) ticker() {
 		rf.mu.Lock()
 		if rf.state != Leader && rf.beats == 0 {
 			// a leader election should be started.
-			rf.candidateCh <- (rf.currentTerm + 1)
+			select{
+			case rf.candidateCh <- (rf.currentTerm + 1):
+			default:
+			}
 		}
 
 		rf.beats = 0
-		// pause for a random amount of time between 500ms and 1000ms
 		rf.mu.Unlock()
+		// pause for a random amount of time between 500ms and 1000ms
 		time.Sleep(randomElectionTimeout())
 	}
 
@@ -325,11 +345,7 @@ func (rf *Raft) sendHeartbeat(server int, term termT) {
 	args := &AppendEntriesArgs{}
 	reply := &AppendEntriesReply{}
 	args.Term = term
-	ok := rf.sendAppendEntries(server, args, reply)
-	if ok && reply.Term > term {
-		// no longer leader
-		rf.followerCh <- reply.Term
-	}
+	rf.sendAppendEntries(server, args, reply)
 }
 
 // Goroutine listening on rf.timer.C.
@@ -354,26 +370,9 @@ func (rf *Raft) bootInit() {
 	rf.n = len(rf.peers)
 	rf.beats = 0
 	rf.votedFor = -1
-	rf.candidateCh = make(chan termT, chanVolume)
-	rf.followerCh = make(chan termT, chanVolume)
-	rf.killCh = make(chan struct{})
+	rf.candidateCh = make(chan termT, 1)
 	rf.timer = softtimer.New(HeartbeatInterval)
 }
-
-// // rf.state and rf.term can only be modified by this method
-// // return false if fromTerm/fromState don't match
-// // enter the method with rf.mu locked
-// func (rf *Raft) stateTransfer(
-// 	fromTerm termT, fromState RaftState,
-// 	toTerm termT, toState RaftState,
-// ) bool {
-// 	if(rf.currentTerm != fromTerm || rf.state != fromState) {
-// 		return false
-// 	}
-// 	rf.currentTerm = toTerm
-// 	rf.state = toState
-// 	return true
-// }
 
 // Goroutine listening on candidateCh.
 // A `term` comes from candidateCh means the server
@@ -400,17 +399,18 @@ func (rf *Raft) toCandidate() {
 			continue
 		}
 		// start election
+		// transfer to candidate
 		rf.currentTerm = term
 		rf.state = Candidate
 		rf.votedFor = rf.me
 
 		// prepare args
-		lastLogIndex := indexT(len(rf.log)-1)
+		// lastLogIndex := indexT(len(rf.log)-1)
 		args := RequestVoteArgs{
 			Term: term,
 			CandidateId: rf.me,
-			LastLogIndex: lastLogIndex,
-			LastLogTerm: termT(rf.log[lastLogIndex].term),
+			// LastLogIndex: lastLogIndex,
+			// LastLogTerm: termT(rf.log[lastLogIndex].term),
 		}
 		rf.mu.Unlock()
 
@@ -435,7 +435,7 @@ func (rf *Raft) toCandidate() {
 					}
 				} else if reply.Term > term {
 					// someone is on a larger term than I'm competing for leader now
-					rf.followerCh <- reply.Term
+					rf.toFollower(reply.Term, false)
 					votes = -1
 					break Inner
 				}
@@ -458,11 +458,12 @@ func (rf *Raft) toCandidate() {
 
 // called by toCandidate()
 // start to send heartbeat
-// C->L
+// Valid transfer: C->L
 func (rf *Raft) toLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.state != Candidate { return }
+	// transfer to leader
 	rf.state = Leader
 	
 	rf.nextIndex = make([]indexT, rf.n)
@@ -475,25 +476,28 @@ func (rf *Raft) toLeader() {
 	rf.timer.Enable(int(rf.currentTerm))
 }
 
-// Goroutine listening on followerCh.
-// Return when killed.
-// Methods that send to followerCh:
-// toCandidate(), 
-// Valid transfers: C->F, L->F
-func (rf *Raft) toFollower() {
-	for term := range(rf.followerCh) {
+
+// called by: toCandidate(), sendAppendEntries()
+// cease to send heartbeat
+// valid transfers: F->F, C->F, L->F
+func (rf *Raft) toFollower(term termT, locked bool) {
+	if !locked {
 		rf.mu.Lock()
-		if rf.state == Follower ||
-		   rf.state == Candidate && rf.currentTerm > term ||
-			 rf.state == Leader && rf.currentTerm >= term {
-			// obsolete request for follower
-			rf.mu.Unlock()
-			continue
-		}
-		// turn to follower
-		rf.state = Follower
+		defer rf.mu.Unlock()
+	}
+	if rf.state == Follower && rf.currentTerm >= term ||
+		 rf.state == Candidate && rf.currentTerm > term ||
+		 rf.state == Leader && rf.currentTerm >= term {
+		// obsolete request
+		return
+	}
+	// transfer to follower
+	rf.state = Follower
+	// when C->F, may be the case where rf.currentTerm == term,
+	// in which we cannot initialize votedFor
+	if rf.currentTerm < term {
 		rf.currentTerm = term
 		rf.votedFor = -1
-		rf.mu.Unlock()
 	}
+	rf.timer.Disable()
 }
