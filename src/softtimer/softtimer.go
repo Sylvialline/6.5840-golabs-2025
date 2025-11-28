@@ -7,16 +7,18 @@ import (
 
 // My soft timer object.
 // Send signal to C every interval time.
-// Use t.Enable()/t.Disable() to temporarily 
-// turn on/off the timer.
+// Use t.Enable(ver)/t.Disable() to temporarily 
+// turn on/off the timer,
+// where ver is the signal you'll get from C.
 // Use t.Close() to close it.
 // Use t.Trigger() to manually update lastExec 
 // with no signal to C.
 
 type SoftTimer struct {
 	interval time.Duration
-	C chan struct{}
+	C chan int
 
+	version int
 	lastExec time.Time
 	enabled bool
 	closed bool
@@ -25,21 +27,26 @@ type SoftTimer struct {
 	wg sync.WaitGroup
 }
 
-type command int8
+type commandType int8
 
 const (
-	cmdEnable command = iota
+	cmdEnable commandType = iota
 	cmdDisable
 	cmdTrigger
 	cmdClose
 )
 
+type command struct {
+	typ commandType
+	ver int
+}
+
 func New(interval time.Duration) *SoftTimer {
 	t := &SoftTimer{
 		interval: interval,
-		C:        make(chan struct{}),
+		C:        make(chan int, 1), // buffer size = 1 makes the most sense
 		lastExec: time.Now(),
-		enabled:  false,
+		enabled:  false, // initially disabled
 		closed:   false,
 		ctrlCh:   make(chan command),
 	}
@@ -48,26 +55,26 @@ func New(interval time.Duration) *SoftTimer {
 	return t
 }
 
-func (t *SoftTimer) Enable() {
-	t.ctrlCh <- cmdEnable
+func (t *SoftTimer) Enable(ver int) {
+	t.ctrlCh <- command{typ: cmdEnable, ver: ver}
 }
 func (t *SoftTimer) Disable() {
-	t.ctrlCh <- cmdDisable
+	t.ctrlCh <- command{typ: cmdDisable}
 }
 func (t *SoftTimer) Trigger() {
-	t.ctrlCh <- cmdTrigger
+	t.ctrlCh <- command{typ: cmdTrigger}
 }
 func (t *SoftTimer) Close() {
-	t.ctrlCh <- cmdClose
+	t.ctrlCh <- command{typ: cmdClose}
 	t.wg.Wait()
 	close(t.C)
-	close(t.ctrlCh)
 }
 
 func (t *SoftTimer) doCmd(cmd command) {
-	switch cmd {
+	switch cmd.typ {
 	case cmdEnable:
 		t.enabled = true
+		t.version = cmd.ver
 	
 	case cmdDisable:
 		t.enabled = false
@@ -116,7 +123,7 @@ func (t *SoftTimer) update() {
 func (t *SoftTimer) execute() {
 	t.update()
 	select{
-	case t.C <- struct{}{}:
+	case t.C <- t.version:
 		// successfully send the tick
 	default:
 		// discard this tick
