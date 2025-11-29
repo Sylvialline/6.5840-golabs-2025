@@ -8,7 +8,9 @@ package raft
 
 import (
 	//	"bytes"
+	"cmp"
 	"math/rand"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,8 +25,8 @@ import (
 
 const (
 	HeartbeatInterval time.Duration = 100 * time.Millisecond + time.Microsecond
-	ElectionTimeoutLower time.Duration = 400 * time.Millisecond
-	ElectionTimeoutUpper time.Duration = 800 * time.Millisecond
+	ElectionTimeoutLower time.Duration = 300 * time.Millisecond
+	ElectionTimeoutUpper time.Duration = 600 * time.Millisecond
 )
 
 func randomElectionTimeout() time.Duration {
@@ -50,8 +52,9 @@ type (
 )
 
 type logEntry struct {
-	// command any
-	// term    termT
+	// 3B
+	Command any
+	Term    termT
 }
 
 // A Go object implementing a single Raft peer.
@@ -61,27 +64,27 @@ type Raft struct {
 	persister *tester.Persister   // Object to hold this peer's persisted state
 	me        idT                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh   chan raftapi.ApplyMsg
 
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
 	// persistent
-	// protected by mu
 	currentTerm termT
 	votedFor    idT // initialized to -1 on every new term
-	log         []logEntry // 1-indexed
+	log         []logEntry
 
 	// volatile on all
 	commitIndex indexT
-	lastApplied indexT
+	lastApplied indexT // not protected by mu
+
 
 	// volatile on leaders
 	nextIndex  []indexT
 	matchIndex []indexT
 
-	// fields defined by me (3A)
-	
+	// 3A
 	// not protected by mu
 	n           int // number of peers
 	candidateCh chan termT // buffer size = 1 makes the most sense
@@ -90,6 +93,10 @@ type Raft struct {
 	// protected by mu
 	state RaftState
 	beats int // count of heartbeats from leader, zeroed each tick
+
+	// 3B
+	applyNotify chan indexT
+	aeChs       []chan bool // false means killed
 }
 
 // return currentTerm and whether this server
@@ -162,16 +169,17 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 // RequestVote RPC arguments structure.
 type RequestVoteArgs struct {
-	// Your data here (3A, 3B).
+	// 3A
 	Term termT
 	CandidateId idT
-	// LastLogIndex indexT
-	// LastLogTerm termT
+	// 3B
+	LastLogIndex indexT
+	LastLogTerm termT
 }
 
 // RequestVote RPC reply structure.
 type RequestVoteReply struct {
-	// Your data here (3A).
+	// 3A
 	Term termT
 	VoteGranted bool
 }
@@ -182,17 +190,28 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	reply.VoteGranted = false
 	if args.Term < rf.currentTerm {
-		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 		return
 	}
 	rf.toFollower(args.Term, Candidate, true)
 	reply.Term = rf.currentTerm
-	if rf.votedFor == -1 {
-		rf.votedFor = args.CandidateId
-		reply.VoteGranted = true
+	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
+		return
 	}
+	// election restriction
+	myLastIndex := lastIndex(rf.log)
+	myLastTerm := rf.log[myLastIndex].Term
+	if args.LastLogTerm < myLastTerm  {
+		return
+	}
+	if args.LastLogTerm == myLastTerm && 
+	   args.LastLogIndex < myLastIndex {
+		return
+	}
+	rf.votedFor = args.CandidateId
+	reply.VoteGranted = true
 }
 
 // RequestVote RPC sender. Goroutine.
@@ -207,23 +226,51 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, replyCh chan 
 type AppendEntriesArgs struct {
 	// 3A
 	Term termT
+	// 3B
+	LeaderId idT
+	PrevLogIndex indexT
+	PrevLogTerm termT
+	Entries []logEntry
+	LeaderCommit indexT
 }
 
 type AppendEntriesReply struct {
 	// 3A
 	Term termT
+	// 3B
+	Success bool
 }
 
 // AppendEntries RPC handler.
 // Sender is a leader.
+// Increase beats, check consistency, append entries
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if args.Term >= rf.currentTerm {
-		rf.beats++
+	reply.Success = false
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
 	}
+	rf.beats++
 	rf.toFollower(args.Term, Leader, true)
 	reply.Term = rf.currentTerm
+	if len(rf.log) <= int(args.PrevLogIndex) ||
+	   rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// do not consistent
+		return
+	}
+	rf.log = rf.log[:args.PrevLogIndex+1] // trunc first: [0, prev]
+	rf.log = append(rf.log, args.Entries...)
+	reply.Success = true
+	N := min(args.LeaderCommit, lastIndex(rf.log))
+	if N > rf.commitIndex {
+		rf.commitIndex = N
+		select {
+		case rf.applyNotify <- N:
+		default:
+		}
+	}
 }
 
 // AppendEntries RPC sender.
@@ -248,14 +295,25 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
 
 	// Your code here (3B).
-
-
-	return index, term, isLeader
+	rf.mu.Lock()
+	if rf.killed() || rf.state != Leader {
+		rf.mu.Unlock()
+		return -1, -1, false
+	}
+	index := len(rf.log)
+	term := rf.currentTerm
+	rf.log = append(rf.log, logEntry{
+		Command: command,
+		Term: term,
+	})
+	rf.mu.Unlock()
+	
+	rf.timer.Trigger()
+	rf.broadcast(true)
+	
+	return index, int(term), true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -271,8 +329,12 @@ func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
 
-	// this line will close timer.C, hence end the loop in heartbeatSender()
+	// Terminate heartbeatSender
 	rf.timer.Close()
+	// Terminate applier
+	close(rf.applyNotify)
+	// Terminate aeSenders
+	rf.broadcast(false)
 }
 
 func (rf *Raft) killed() bool {
@@ -298,19 +360,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = idT(me)
 
 	// Your initialization code here (3A, 3B, 3C).
+	rf.applyCh = applyCh
 	rf.bootInit()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	// periodically inform toCandidate() to start elections
-	go rf.ticker()
-
-	// send heartbeats when it's leader
-	go rf.heartbeatSender()
-
-	// wait for new elections
-	go rf.toCandidate()
+	rf.goroutineInit()
 
 	return rf
 }
@@ -333,32 +389,10 @@ func (rf *Raft) ticker() {
 		// pause for a random amount of time between 500ms and 1000ms
 		time.Sleep(randomElectionTimeout())
 	}
-
-	close(rf.candidateCh) // stop toCandidate()
+	// Terminate toCandidate
+	close(rf.candidateCh) 
 }
-
-// my methods for 3A
-
-// Heartbeat sender. Goroutine.
-func (rf *Raft) sendHeartbeat(server int, term termT) {
-	args := &AppendEntriesArgs{}
-	reply := &AppendEntriesReply{}
-	args.Term = term
-	rf.sendAppendEntries(server, args, reply)
-}
-
-// Goroutine listening on rf.timer.C.
-// On every signal received from rf.timer.C, 
-// send a heartbeat to all peers.
-// Guaranteed to return when killed.
-func (rf *Raft) heartbeatSender() {
-	for term := range(rf.timer.C) {
-		for i := 0; i < rf.n; i++ {
-			if i == int(rf.me) { continue }
-			go rf.sendHeartbeat(i, termT(term))
-		}
-	}
-}
+// init methods
 
 func (rf *Raft) bootInit() {
 	rf.dead = 0
@@ -371,6 +405,158 @@ func (rf *Raft) bootInit() {
 	rf.votedFor = -1
 	rf.candidateCh = make(chan termT, 1)
 	rf.timer = softtimer.New(HeartbeatInterval)
+
+	rf.log = append(rf.log, logEntry{}) // might be overwritten by readPersist()
+	rf.applyNotify = make(chan indexT, 1)
+	rf.aeChs = make([]chan bool, rf.n)
+
+}
+
+func (rf *Raft) goroutineInit() {
+	// periodically inform toCandidate() to start elections
+	go rf.ticker()
+
+	// send heartbeats when it's leader
+	go rf.heartbeatSender()
+
+	// wait for new elections
+	go rf.toCandidate()
+
+	go rf.applier()
+
+	for i := 0; i < rf.n; i++ {
+		if i == int(rf.me) { continue }
+		rf.aeChs[i] = make(chan bool, chanVolume)
+		go rf.aeSender(i)
+	}
+}
+
+
+// my methods for 3B
+
+func lastIndex[T any](a []T) indexT {
+	return indexT(len(a) - 1)
+}
+
+func median[T cmp.Ordered](a []T) T {
+	b := slices.Clone(a)
+	slices.Sort(b)
+	return b[len(b)/2]
+}
+
+// Goroutine listening on applyNotify
+// Applies newly committed entries to applyCh
+// (assume applyCh to be very congested)
+// Owns rf.lastApplied (so no lock when use it)
+// Return when killed
+func (rf *Raft) applier() {
+	for i := range(rf.applyNotify) {
+		rf.mu.Lock()
+		i = rf.commitIndex
+		rf.mu.Unlock()
+		if i <= rf.lastApplied { continue }
+		for k := rf.lastApplied + 1; k <= i; k++ {
+			rf.mu.Lock()
+			e := rf.log[k]
+			rf.mu.Unlock()
+			// assume applyCh to be very congested
+			rf.applyCh <- raftapi.ApplyMsg{
+				CommandValid: true,
+				Command: e.Command,
+				CommandIndex: int(k),
+			}
+		}
+		rf.lastApplied = i
+	}
+}
+
+// called by leader
+// calculate new commitIndex
+// caller must hold mu
+func (rf *Raft) commit() {
+	rf.matchIndex[rf.me] = lastIndex(rf.log) // COUNT YOURSELF!
+	N := median(rf.matchIndex)
+	if N > rf.commitIndex && rf.log[N].Term == rf.currentTerm {
+		rf.commitIndex = N
+		select {
+		case rf.applyNotify <- N:
+		default:
+		}
+	}
+}
+
+// AppendEntries RPC sender for each server
+// Return when killed (on a false signal)
+func (rf *Raft) aeSender(server int) {
+	ch := rf.aeChs[server]
+	for b := range(ch) {
+		if !b { return }
+		args := &AppendEntriesArgs{}
+		reply := &AppendEntriesReply{}
+		rf.mu.Lock()
+		if rf.state != Leader {
+			// must not send AEs with new term but as follower
+			rf.mu.Unlock()
+			continue
+		}
+		term := rf.currentTerm
+		next := rf.nextIndex[server]
+
+		args.Term = term
+		args.LeaderId = rf.me
+		args.PrevLogIndex = next - 1
+		args.PrevLogTerm = rf.log[next - 1].Term
+		args.Entries = rf.log[next:]
+		args.LeaderCommit = rf.commitIndex
+		l := len(args.Entries) // l==0 -> heartbeat
+		rf.mu.Unlock()
+
+		ok := rf.sendAppendEntries(server, args, reply)
+		if !ok {
+			continue
+		}
+
+		rf.mu.Lock()
+		if rf.state != Leader || rf.currentTerm != term { 
+			// discard the reply if term changed, even if it's leader again
+			// because uncommitted entries can be overwritten by other leaders
+			rf.mu.Unlock()
+			continue
+		}
+
+		if reply.Success {
+			rf.nextIndex[server] = next + indexT(l)
+			rf.matchIndex[server] = rf.nextIndex[server] - 1
+			rf.commit()
+		} else {
+			// consistency check failed
+			rf.nextIndex[server] --
+			ch <- true // try again
+		}
+		rf.mu.Unlock()
+	}
+}
+
+// send true/false to all aeChs
+// used to send heartbeats/AEs/kill signals
+func (rf *Raft) broadcast(b bool) {
+	for i := 0; i < rf.n; i++ {
+		if i == int(rf.me) { continue }
+		rf.aeChs[i] <- b
+	}
+}
+
+// my methods for 3A
+
+
+// Goroutine listening on rf.timer.C.
+// On every signal received from rf.timer.C, 
+// send a heartbeat to all peers.
+// Guaranteed to return when killed.
+func (rf *Raft) heartbeatSender() {
+	for range(rf.timer.C) {
+		rf.broadcast(true)
+	}
 }
 
 // Goroutine listening on candidateCh.
@@ -404,12 +590,12 @@ func (rf *Raft) toCandidate() {
 		rf.votedFor = rf.me
 
 		// prepare args
-		// lastLogIndex := indexT(len(rf.log)-1)
+		lastLogIndex := lastIndex(rf.log)
 		args := RequestVoteArgs{
 			Term: term,
 			CandidateId: rf.me,
-			// LastLogIndex: lastLogIndex,
-			// LastLogTerm: termT(rf.log[lastLogIndex].term),
+			LastLogIndex: lastLogIndex,
+			LastLogTerm: termT(rf.log[lastLogIndex].Term),
 		}
 		rf.mu.Unlock()
 
@@ -422,7 +608,7 @@ func (rf *Raft) toCandidate() {
 
 		// count votes
 		// while listening on next term from candidateCh
-		votes := 1
+		votes := 1 // COUNT YOURSELF!
 		Inner:
 		for {
 			select {
@@ -457,6 +643,7 @@ func (rf *Raft) toCandidate() {
 
 // called by toCandidate()
 // start to send heartbeat
+// Including leader initialization
 // Valid transfer: C->L
 func (rf *Raft) toLeader() {
 	rf.mu.Lock()
@@ -469,7 +656,7 @@ func (rf *Raft) toLeader() {
 	rf.matchIndex = make([]indexT, rf.n)
 	for i := 0; i < rf.n; i++ {
 		rf.nextIndex[i] = indexT(len(rf.log))
-		rf.matchIndex[i] = 0
+		rf.matchIndex[i] = 0 // match at index 0
 	}
 
 	rf.timer.Enable(int(rf.currentTerm))
