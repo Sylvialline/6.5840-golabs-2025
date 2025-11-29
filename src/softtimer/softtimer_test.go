@@ -40,7 +40,7 @@ func TestSoftTimer_AutoTick(t *testing.T) {
     }
 }
 
-// 2. Trigger 只更新时间，不发 signal
+// 2. Trigger 只更新时间，不发 signal（当 enabled）
 func TestSoftTimer_TriggerNoSignal(t *testing.T) {
     interval := 200 * time.Millisecond
     timer := New(interval)
@@ -48,8 +48,10 @@ func TestSoftTimer_TriggerNoSignal(t *testing.T) {
 
     timer.Enable(1)
 
-    // 立即 Trigger 一下，应该不会立刻有 signal
-    timer.Trigger()
+    // Trigger 返回当前版本
+    if v := timer.Trigger(); v != 1 {
+        t.Fatalf("expected Trigger to return version 1, got %v", v)
+    }
 
     // 在小于 interval 的时间内，不应该收到任何信号
     waitNoSignal(t, timer.C, interval/2)
@@ -73,7 +75,10 @@ func TestSoftTimer_TriggerDelaysNextTick(t *testing.T) {
     // 过一点点时间再 Trigger，相当于“重置 lastExec”
     time.Sleep(50 * time.Millisecond)
     triggerTime := time.Now()
-    timer.Trigger()
+
+    if v := timer.Trigger(); v != 10 {
+        t.Fatalf("expected Trigger return 10, got %v", v)
+    }
 
     // 接下来 < interval 时间内，不应该再有 tick
     waitNoSignal(t, timer.C, interval-50*time.Millisecond)
@@ -87,7 +92,7 @@ func TestSoftTimer_TriggerDelaysNextTick(t *testing.T) {
     }
 }
 
-// 4. Disable 之后不再自动 tick，但 Trigger 仍然只更新时间，不发 signal
+// 4. Disable 之后不再自动 tick；Trigger 返回 -1 且不更新时间
 func TestSoftTimer_DisableStopsAuto(t *testing.T) {
     interval := 100 * time.Millisecond
     timer := New(interval)
@@ -104,11 +109,15 @@ func TestSoftTimer_DisableStopsAuto(t *testing.T) {
 
     timer.Disable()
 
-    // 关闭后，不应该再有自动 tick
+    // Disable 后不会自动 tick
     waitNoSignal(t, timer.C, 3*interval)
 
-    // 调用 Trigger：仍然不应该发 signal（只更新时间）
-    timer.Trigger()
+    // Trigger 应返回 -1
+    if v := timer.Trigger(); v != -1 {
+        t.Fatalf("expected Trigger to return -1 when disabled, got %v", v)
+    }
+
+    // Trigger 不应发信号
     waitNoSignal(t, timer.C, interval/2)
 }
 
@@ -129,8 +138,9 @@ func TestSoftTimer_EnableAfterDisable(t *testing.T) {
     // 确认禁用期间不会自动 tick
     waitNoSignal(t, timer.C, 2*interval)
 
+    // 再 Enable，使用新版 version
     timer.Enable(6)
-    // 重新 Enable 之后，应该又能自动 tick（版本号应更新）
+
     if v, ok := waitSignal(timer.C, 3*interval); !ok {
         t.Fatalf("expected auto tick after re-enable")
     } else if v != 6 {

@@ -11,8 +11,6 @@ import (
 // turn on/off the timer,
 // where ver is the signal you'll get from C.
 // Use t.Close() to close it.
-// Use t.Trigger() to manually update lastExec 
-// with no signal to C.
 
 type SoftTimer struct {
 	interval time.Duration
@@ -39,6 +37,7 @@ const (
 type command struct {
 	typ commandType
 	ver int
+	tempCh chan int
 }
 
 func New(interval time.Duration) *SoftTimer {
@@ -48,21 +47,33 @@ func New(interval time.Duration) *SoftTimer {
 		lastExec: time.Now(),
 		enabled:  false, // initially disabled
 		closed:   false,
-		ctrlCh:   make(chan command),
+		ctrlCh:   make(chan command, 1),
 	}
 	t.wg.Add(1)
 	go t.loop()
 	return t
 }
 
+// Enable()/Disable()/Trigger()/Close() won't return 
+// until loop() processed the command
 func (t *SoftTimer) Enable(ver int) {
-	t.ctrlCh <- command{typ: cmdEnable, ver: ver}
+	ch := make(chan int, 1)
+	t.ctrlCh <- command{typ: cmdEnable, ver: ver, tempCh: ch}
+	<-ch
 }
 func (t *SoftTimer) Disable() {
-	t.ctrlCh <- command{typ: cmdDisable}
+	ch := make(chan int, 1)
+	t.ctrlCh <- command{typ: cmdDisable, tempCh: ch}
+	<-ch
 }
-func (t *SoftTimer) Trigger() {
-	t.ctrlCh <- command{typ: cmdTrigger}
+// If enabled, calls to t.Trigger() manually update lastExec 
+// and return the current version.
+// If disabled, t.Trigger() returns -1, 
+// with no changes in lastExec
+func (t *SoftTimer) Trigger() int {
+	ch := make(chan int, 1)
+	t.ctrlCh <- command{typ: cmdTrigger, tempCh: ch}
+	return <-ch
 }
 func (t *SoftTimer) Close() {
 	t.ctrlCh <- command{typ: cmdClose}
@@ -75,12 +86,19 @@ func (t *SoftTimer) doCmd(cmd command) {
 	case cmdEnable:
 		t.enabled = true
 		t.version = cmd.ver
+		cmd.tempCh <- 0
 	
 	case cmdDisable:
 		t.enabled = false
+		cmd.tempCh <- 0
 
 	case cmdTrigger:
-		t.update()
+		if t.enabled {
+			t.update()
+			cmd.tempCh <- t.version
+		} else {
+			cmd.tempCh <- -1
+		}
 
 	case cmdClose:
 		t.closed = true
@@ -88,6 +106,7 @@ func (t *SoftTimer) doCmd(cmd command) {
 }
 
 // looping while handling the commands
+// exclusively owns all vars, so no locks needed
 func (t *SoftTimer) loop() {
 	defer t.wg.Done()
 	for {
