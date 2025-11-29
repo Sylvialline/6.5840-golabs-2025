@@ -23,8 +23,8 @@ import (
 
 const (
 	HeartbeatInterval time.Duration = 100 * time.Millisecond + time.Microsecond
-	ElectionTimeoutLower time.Duration = 500 * time.Millisecond
-	ElectionTimeoutUpper time.Duration = 1000 * time.Millisecond
+	ElectionTimeoutLower time.Duration = 400 * time.Millisecond
+	ElectionTimeoutUpper time.Duration = 800 * time.Millisecond
 )
 
 func randomElectionTimeout() time.Duration {
@@ -37,7 +37,8 @@ const chanVolume = 100
 type RaftState int8 
 
 const (
-	Follower RaftState = iota
+	Any RaftState = iota
+	Follower 
 	Candidate
 	Leader
 )
@@ -49,8 +50,8 @@ type (
 )
 
 type logEntry struct {
-	command any
-	term    termT
+	// command any
+	// term    termT
 }
 
 // A Go object implementing a single Raft peer.
@@ -79,30 +80,25 @@ type Raft struct {
 	nextIndex  []indexT
 	matchIndex []indexT
 
-	// my defined fields (3A)
+	// fields defined by me (3A)
 	
 	// not protected by mu
 	n           int // number of peers
 	candidateCh chan termT // buffer size = 1 makes the most sense
+	timer *softtimer.SoftTimer 
 
 	// protected by mu
 	state RaftState
 	beats int // count of heartbeats from leader, zeroed each tick
-	timer *softtimer.SoftTimer    
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-
 	// Your code here (3A).
-	term = int(rf.currentTerm)
-	isleader = rf.state == Leader
-
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return int(rf.currentTerm), rf.state == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -162,7 +158,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 
-// RPCs (3A)
+// RPCs
 
 // RequestVote RPC arguments structure.
 type RequestVoteArgs struct {
@@ -181,6 +177,7 @@ type RequestVoteReply struct {
 }
 
 // RequestVote RPC handler.
+// Sender is a candidate.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
@@ -190,9 +187,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		return
 	}
-	if args.Term > rf.currentTerm {
-		rf.toFollower(args.Term, true)
-	}
+	rf.toFollower(args.Term, Candidate, true)
 	reply.Term = rf.currentTerm
 	if rf.votedFor == -1 {
 		rf.votedFor = args.CandidateId
@@ -200,7 +195,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
-// RequestVote RPC sender.
+// RequestVote RPC sender. Goroutine.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, replyCh chan RequestVoteReply) {
 	reply := RequestVoteReply{}
 	ok := rf.peers[server].Call("Raft.RequestVote", args, &reply)
@@ -219,20 +214,23 @@ type AppendEntriesReply struct {
 	Term termT
 }
 
+// AppendEntries RPC handler.
+// Sender is a leader.
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if args.Term > rf.currentTerm {
-		rf.toFollower(args.Term, true)
+	if args.Term >= rf.currentTerm {
+		rf.beats++
 	}
+	rf.toFollower(args.Term, Leader, true)
 	reply.Term = rf.currentTerm
 }
 
-
+// AppendEntries RPC sender.
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if ok && reply.Term > args.Term {
-		rf.toFollower(reply.Term, false)
+	if ok {
+		rf.toFollower(reply.Term, Any, false)
 	}
 	return ok
 }
@@ -341,6 +339,7 @@ func (rf *Raft) ticker() {
 
 // my methods for 3A
 
+// Heartbeat sender. Goroutine.
 func (rf *Raft) sendHeartbeat(server int, term termT) {
 	args := &AppendEntriesArgs{}
 	reply := &AppendEntriesReply{}
@@ -418,12 +417,12 @@ func (rf *Raft) toCandidate() {
 		replyCh := make(chan RequestVoteReply, chanVolume)
 		for i := 0; i < rf.n; i++ {
 			if i == int(rf.me) { continue }
-			rf.sendRequestVote(i, &args, replyCh)
+			go rf.sendRequestVote(i, &args, replyCh)
 		}
 
 		// count votes
 		// while listening on next term from candidateCh
-		votes := 0
+		votes := 1
 		Inner:
 		for {
 			select {
@@ -435,7 +434,7 @@ func (rf *Raft) toCandidate() {
 					}
 				} else if reply.Term > term {
 					// someone is on a larger term than I'm competing for leader now
-					rf.toFollower(reply.Term, false)
+					rf.toFollower(reply.Term, Any, false)
 					votes = -1
 					break Inner
 				}
@@ -477,19 +476,24 @@ func (rf *Raft) toLeader() {
 }
 
 
-// called by: toCandidate(), sendAppendEntries()
+// locked caller: AppendEntries(), RequestVote()
+// unlocked caller: toCandidate(), sendAppendEntries()
 // cease to send heartbeat
+// argument who indicates who wants me to become follower
 // valid transfers: F->F, C->F, L->F
-func (rf *Raft) toFollower(term termT, locked bool) {
+func (rf *Raft) toFollower(term termT, who RaftState, locked bool) {
 	if !locked {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 	}
-	if rf.state == Follower && rf.currentTerm >= term ||
-		 rf.state == Candidate && rf.currentTerm > term ||
-		 rf.state == Leader && rf.currentTerm >= term {
-		// obsolete request
-		return
+	if rf.state == Candidate && who == Leader {
+		if rf.currentTerm > term {
+			return
+		}
+	} else {
+		if rf.currentTerm >= term {
+			return
+		}
 	}
 	// transfer to follower
 	rf.state = Follower
