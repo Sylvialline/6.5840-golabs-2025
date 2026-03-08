@@ -8,7 +8,6 @@ package raft
 
 import (
 	//	"bytes"
-	"cmp"
 	"math/rand"
 	"slices"
 	"sync"
@@ -255,7 +254,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.beats++
 	rf.toFollower(args.Term, Leader, true)
 	reply.Term = rf.currentTerm
-	if len(rf.log) <= int(args.PrevLogIndex) ||
+	if lastIndex(rf.log) < args.PrevLogIndex ||
 	   rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		// do not consistent
 		return
@@ -266,10 +265,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	N := min(args.LeaderCommit, lastIndex(rf.log))
 	if N > rf.commitIndex {
 		rf.commitIndex = N
-		select {
-		case rf.applyNotify <- N:
-		default:
-		}
+		testSend(rf.applyNotify, N)
 	}
 }
 
@@ -310,7 +306,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	})
 	rf.mu.Unlock()
 	
-	rf.timer.Trigger()
+	rf.timer.Reset()
 	rf.broadcast(true)
 	
 	return index, int(term), true
@@ -329,11 +325,11 @@ func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
 
-	// Terminate heartbeatSender
+	// Terminate aeTicker
 	rf.timer.Close()
 	// Terminate applier
 	close(rf.applyNotify)
-	// Terminate aeSenders
+	// Terminate aeWorkers
 	rf.broadcast(false)
 }
 
@@ -372,24 +368,27 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 
-func (rf *Raft) ticker() {
+func (rf *Raft) rvTicker() {
 	for !rf.killed() {
 		// Your code here (3A)
+		nextTerm := termT(-1)
+
 		rf.mu.Lock()
 		if rf.state != Leader && rf.beats == 0 {
 			// a leader election should be started.
-			select{
-			case rf.candidateCh <- (rf.currentTerm + 1):
-			default:
-			}
+			nextTerm = rf.currentTerm + 1
 		}
-
 		rf.beats = 0
 		rf.mu.Unlock()
-		// pause for a random amount of time between 500ms and 1000ms
+
+		if nextTerm != -1 {
+			rf.candidateCh <- nextTerm
+		}
+		// pause for a random amount of time between
+		//  `ElectionTimeoutLower` and `ElectionTimeoutUpper`
 		time.Sleep(randomElectionTimeout())
 	}
-	// Terminate toCandidate
+	// Terminate goroutine toCandidate()
 	close(rf.candidateCh) 
 }
 // init methods
@@ -414,10 +413,10 @@ func (rf *Raft) bootInit() {
 
 func (rf *Raft) goroutineInit() {
 	// periodically inform toCandidate() to start elections
-	go rf.ticker()
+	go rf.rvTicker()
 
 	// send heartbeats when it's leader
-	go rf.heartbeatSender()
+	go rf.aeTicker()
 
 	// wait for new elections
 	go rf.toCandidate()
@@ -426,23 +425,13 @@ func (rf *Raft) goroutineInit() {
 
 	for i := 0; i < rf.n; i++ {
 		if i == int(rf.me) { continue }
-		rf.aeChs[i] = make(chan bool, chanVolume)
-		go rf.aeSender(i)
+		rf.aeChs[i] = make(chan bool, 4)
+		go rf.aeWorker(i)
 	}
 }
 
 
 // my methods for 3B
-
-func lastIndex[T any](a []T) indexT {
-	return indexT(len(a) - 1)
-}
-
-func median[T cmp.Ordered](a []T) T {
-	b := slices.Clone(a)
-	slices.Sort(b)
-	return b[len(b)/2]
-}
 
 // Goroutine listening on applyNotify
 // Applies newly committed entries to applyCh
@@ -453,17 +442,18 @@ func (rf *Raft) applier() {
 	for i := range(rf.applyNotify) {
 		rf.mu.Lock()
 		i = rf.commitIndex
-		rf.mu.Unlock()
-		if i <= rf.lastApplied { continue }
-		for k := rf.lastApplied + 1; k <= i; k++ {
-			rf.mu.Lock()
-			e := rf.log[k]
+		if i <= rf.lastApplied {
 			rf.mu.Unlock()
+			continue
+		}
+		log := slices.Clone(rf.log[rf.lastApplied+1 : i+1])
+		rf.mu.Unlock()
+		for k, e := range log {
 			// assume applyCh to be very congested
 			rf.applyCh <- raftapi.ApplyMsg{
 				CommandValid: true,
 				Command: e.Command,
-				CommandIndex: int(k),
+				CommandIndex: k + int(rf.lastApplied + 1),
 			}
 		}
 		rf.lastApplied = i
@@ -478,16 +468,13 @@ func (rf *Raft) commit() {
 	N := median(rf.matchIndex)
 	if N > rf.commitIndex && rf.log[N].Term == rf.currentTerm {
 		rf.commitIndex = N
-		select {
-		case rf.applyNotify <- N:
-		default:
-		}
+		testSend(rf.applyNotify, N)
 	}
 }
 
 // AppendEntries RPC sender for each server
 // Return when killed (on a false signal)
-func (rf *Raft) aeSender(server int) {
+func (rf *Raft) aeWorker(server int) {
 	ch := rf.aeChs[server]
 	for b := range(ch) {
 		if !b { return }
@@ -531,7 +518,7 @@ func (rf *Raft) aeSender(server int) {
 		} else {
 			// consistency check failed
 			rf.nextIndex[server] --
-			ch <- true // try again
+			testSend(ch, true) // try again
 		}
 		rf.mu.Unlock()
 	}
@@ -542,7 +529,11 @@ func (rf *Raft) aeSender(server int) {
 func (rf *Raft) broadcast(b bool) {
 	for i := 0; i < rf.n; i++ {
 		if i == int(rf.me) { continue }
-		rf.aeChs[i] <- b
+		if b {
+			testSend(rf.aeChs[i], true)
+		} else {
+			rf.aeChs[i] <- false
+		}
 	}
 }
 
@@ -553,7 +544,7 @@ func (rf *Raft) broadcast(b bool) {
 // On every signal received from rf.timer.C, 
 // send a heartbeat to all peers.
 // Guaranteed to return when killed.
-func (rf *Raft) heartbeatSender() {
+func (rf *Raft) aeTicker() {
 	for range(rf.timer.C) {
 		rf.broadcast(true)
 	}
@@ -576,11 +567,15 @@ func (rf *Raft) toCandidate() {
 		if rf.state == Leader {
 			// L->C not allowed
 			rf.mu.Unlock()
+			i, ok = <-rf.candidateCh
+			if !ok { return }
 			continue
 		}
 		if rf.currentTerm >= term {
 			// obsolete election
 			rf.mu.Unlock()
+			i, ok = <-rf.candidateCh
+			if !ok { return }
 			continue
 		}
 		// start election
@@ -595,7 +590,7 @@ func (rf *Raft) toCandidate() {
 			Term: term,
 			CandidateId: rf.me,
 			LastLogIndex: lastLogIndex,
-			LastLogTerm: termT(rf.log[lastLogIndex].Term),
+			LastLogTerm: rf.log[lastLogIndex].Term,
 		}
 		rf.mu.Unlock()
 
