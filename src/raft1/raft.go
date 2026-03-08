@@ -269,22 +269,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 }
 
-// AppendEntries RPC sender.
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	DPrintf("AE: %v -> %v | MOUNT --- args.Term = %v", rf.me, server, args.Term)
-	start := time.Now()
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	duration := time.Since(start).Microseconds()
-	if ok {
-		DPrintf("AE: %v -> %v | SUCCESS(%vμs) --- reply.Term = %v, reply.Success = %v",
-		 rf.me, server, duration, reply.Term, reply.Success)
-		rf.toFollower(reply.Term, Any, false)
-	} else {
-		DPrintf("AE: %v -> %v | FAIL(%vμs)", rf.me, server, duration)
-	}
-	return ok
-}
-
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -440,6 +424,36 @@ func (rf *Raft) goroutineInit() {
 
 // my methods for 3B
 
+// Goroutine that send an AppendEntries to server
+// and deals with the reply.
+// When redo is needed, send true to ch.
+func (rf *Raft) aeSender(server int, args *AppendEntriesArgs, ch chan bool) {
+	reply := &AppendEntriesReply{}
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if !ok { return }
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.toFollower(reply.Term, Any, true)
+	if rf.state != Leader || rf.currentTerm != args.Term { 
+		// discard the reply if term changed, even if it's leader again
+		// because uncommitted entries can be overwritten by other leaders
+		return
+	}
+
+	if reply.Success {
+		l := len(args.Entries)
+		rf.matchIndex[server] = args.PrevLogIndex + indexT(l)
+		rf.nextIndex[server] = rf.matchIndex[server] + 1
+		rf.commit()
+	} else {
+		// consistency check failed
+		rf.nextIndex[server] --
+		testSend(ch, true) // try again
+	}
+}
+
 // Goroutine listening on applyNotify
 // Applies newly committed entries to applyCh
 // (assume applyCh to be very congested)
@@ -479,14 +493,16 @@ func (rf *Raft) commit() {
 	}
 }
 
-// AppendEntries RPC sender for each server
+// AppendEntries RPC manager for `server`.
+// Construct the args and limit the amount of AEs
+// sending to `server`.
+// Call aeSender to send AE and handle its reply.
 // Return when killed (on a false signal)
 func (rf *Raft) aeWorker(server int) {
 	ch := rf.aeChs[server]
 	for b := range(ch) {
 		if !b { return }
 		args := &AppendEntriesArgs{}
-		reply := &AppendEntriesReply{}
 		rf.mu.Lock()
 		if rf.state != Leader {
 			// must not send AEs with new term but as follower
@@ -502,32 +518,9 @@ func (rf *Raft) aeWorker(server int) {
 		args.PrevLogTerm = rf.log[next - 1].Term
 		args.Entries = rf.log[next:]
 		args.LeaderCommit = rf.commitIndex
-		l := len(args.Entries) // l==0 -> heartbeat
 		rf.mu.Unlock()
 
-		ok := rf.sendAppendEntries(server, args, reply)
-		if !ok {
-			continue
-		}
-
-		rf.mu.Lock()
-		if rf.state != Leader || rf.currentTerm != term { 
-			// discard the reply if term changed, even if it's leader again
-			// because uncommitted entries can be overwritten by other leaders
-			rf.mu.Unlock()
-			continue
-		}
-
-		if reply.Success {
-			rf.nextIndex[server] = next + indexT(l)
-			rf.matchIndex[server] = rf.nextIndex[server] - 1
-			rf.commit()
-		} else {
-			// consistency check failed
-			rf.nextIndex[server] --
-			testSend(ch, true) // try again
-		}
-		rf.mu.Unlock()
+		go rf.aeSender(server, args, ch)
 	}
 }
 
