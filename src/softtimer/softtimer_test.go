@@ -40,25 +40,25 @@ func TestSoftTimer_AutoTick(t *testing.T) {
     }
 }
 
-// 2. Trigger 只更新时间，不发 signal（当 enabled）
-func TestSoftTimer_TriggerNoSignal(t *testing.T) {
+// 2. Reset 只更新时间，不发 signal（当 enabled）
+func TestSoftTimer_ResetNoSignal(t *testing.T) {
     interval := 200 * time.Millisecond
     timer := New(interval)
     defer timer.Close()
 
     timer.Enable(1)
 
-    // Trigger 返回当前版本
-    if v := timer.Trigger(); v != 1 {
-        t.Fatalf("expected Trigger to return version 1, got %v", v)
+    // Reset 返回当前版本
+    if v := timer.Reset(); v != 1 {
+        t.Fatalf("expected Reset to return version 1, got %v", v)
     }
 
     // 在小于 interval 的时间内，不应该收到任何信号
     waitNoSignal(t, timer.C, interval/2)
 }
 
-// 3. Trigger 会推迟下一次自动 tick
-func TestSoftTimer_TriggerDelaysNextTick(t *testing.T) {
+// 3. Reset 会推迟下一次自动 tick
+func TestSoftTimer_ResetDelaysNextTick(t *testing.T) {
     interval := 200 * time.Millisecond
     timer := New(interval)
     defer timer.Close()
@@ -72,12 +72,12 @@ func TestSoftTimer_TriggerDelaysNextTick(t *testing.T) {
         t.Fatalf("unexpected version: got %v, want 10", v)
     }
 
-    // 过一点点时间再 Trigger，相当于“重置 lastExec”
+    // 过一点点时间再 Reset，相当于“重置 lastExec”
     time.Sleep(50 * time.Millisecond)
-    triggerTime := time.Now()
+    resetTime := time.Now()
 
-    if v := timer.Trigger(); v != 10 {
-        t.Fatalf("expected Trigger return 10, got %v", v)
+    if v := timer.Reset(); v != 10 {
+        t.Fatalf("expected Reset return 10, got %v", v)
     }
 
     // 接下来 < interval 时间内，不应该再有 tick
@@ -86,13 +86,13 @@ func TestSoftTimer_TriggerDelaysNextTick(t *testing.T) {
     // 再过一段时间，应该出现新的自动 tick
     deadline := interval + 2*interval // 给一点冗余
     if v, ok := waitSignal(timer.C, deadline); !ok {
-        t.Fatalf("expected auto tick delayed after Trigger() at %v", triggerTime)
+        t.Fatalf("expected auto tick delayed after Reset() at %v", resetTime)
     } else if v != 10 {
-        t.Fatalf("unexpected version after Trigger: got %v, want 10", v)
+        t.Fatalf("unexpected version after Reset: got %v, want 10", v)
     }
 }
 
-// 4. Disable 之后不再自动 tick；Trigger 返回 -1 且不更新时间
+// 4. Disable 之后不再自动 tick；Reset 返回 -1 且不更新时间
 func TestSoftTimer_DisableStopsAuto(t *testing.T) {
     interval := 100 * time.Millisecond
     timer := New(interval)
@@ -112,12 +112,12 @@ func TestSoftTimer_DisableStopsAuto(t *testing.T) {
     // Disable 后不会自动 tick
     waitNoSignal(t, timer.C, 3*interval)
 
-    // Trigger 应返回 -1
-    if v := timer.Trigger(); v != -1 {
-        t.Fatalf("expected Trigger to return -1 when disabled, got %v", v)
+    // Reset 应返回 -1
+    if v := timer.Reset(); v != -1 {
+        t.Fatalf("expected Reset to return -1 when disabled, got %v", v)
     }
 
-    // Trigger 不应发信号
+    // Reset 不应发信号
     waitNoSignal(t, timer.C, interval/2)
 }
 
@@ -164,4 +164,29 @@ func TestSoftTimer_Close(t *testing.T) {
     if ok {
         t.Fatalf("expected C to be closed after Close()")
     }
+}
+
+// ex. Close() 之后，后续控制调用至少不应该永久阻塞。
+// 先前实现里，Close() 会让 loop() 直接退出；
+// 此后 Reset()/Enable()/Disable() 往 ctrlCh 发送命令后，
+// 会一直等 tempCh 的回复，但已经没有 goroutine 会处理它了，
+// 因而这个测试会失败。
+func TestSoftTimer_ResetAfterCloseShouldNotBlock(t *testing.T) {
+	tm := New(time.Hour)
+
+	// 先关闭，确保 loop() 已经退出
+	tm.Close()
+
+	done := make(chan struct{})
+	go func() {
+		_ = tm.Reset()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// 理想行为：不要永久阻塞
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Reset() blocked after Close()")
+	}
 }

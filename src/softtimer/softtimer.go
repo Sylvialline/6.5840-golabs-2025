@@ -2,16 +2,18 @@ package softtimer
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // My soft timer object.
 // Send signal to C every interval time.
-// Use t.Enable(ver)/t.Disable() to temporarily 
+// Use t.Enable(ver)/t.Disable() to temporarily
 // turn on/off the timer,
 // where ver is the signal you'll get from C.
 // Use t.Close() to close it.
-
+// Use t.Reset() to reset the timer, without any signal sending to C.
+// After the first call to Close(), all control functions return immediately.
 type SoftTimer struct {
 	interval time.Duration
 	C chan int
@@ -19,7 +21,8 @@ type SoftTimer struct {
 	version int
 	lastExec time.Time
 	enabled bool
-	closed bool
+	closed atomic.Int32 // The atomic.Int32 field closed ensures the timer is closed only once.
+	done chan struct{}
 
 	ctrlCh chan command
 	wg sync.WaitGroup
@@ -30,7 +33,7 @@ type commandType int8
 const (
 	cmdEnable commandType = iota
 	cmdDisable
-	cmdTrigger
+	cmdReset
 	cmdClose
 )
 
@@ -43,42 +46,72 @@ type command struct {
 func New(interval time.Duration) *SoftTimer {
 	t := &SoftTimer{
 		interval: interval,
-		C:        make(chan int, 1), // buffer size = 1 makes the most sense
+		C:        make(chan int, 1),
 		lastExec: time.Now(),
 		enabled:  false, // initially disabled
-		closed:   false,
-		ctrlCh:   make(chan command, 1),
+		done:     make(chan struct{}),
+		closed:   atomic.Int32{},
+		ctrlCh:   make(chan command, 16),
 	}
 	t.wg.Add(1)
 	go t.loop()
 	return t
 }
 
-// Enable()/Disable()/Trigger()/Close() won't return 
+func (t *SoftTimer) send(typ commandType,	ver int) int {
+	cmd := command{
+		typ: typ,
+		ver: ver,
+		tempCh: make(chan int, 1),
+	}
+
+	select{
+	case t.ctrlCh <- cmd:
+	case <-t.done:
+		return -2
+	}
+
+	select{
+	case v := <-cmd.tempCh:
+		return v
+	case <-t.done:
+		return -2
+	}
+}
+
+// Enable()/Disable()/Reset()/Close() won't return 
 // until loop() processed the command
 func (t *SoftTimer) Enable(ver int) {
-	ch := make(chan int, 1)
-	t.ctrlCh <- command{typ: cmdEnable, ver: ver, tempCh: ch}
-	<-ch
+	t.send(cmdEnable, ver)
 }
 func (t *SoftTimer) Disable() {
-	ch := make(chan int, 1)
-	t.ctrlCh <- command{typ: cmdDisable, tempCh: ch}
-	<-ch
+	t.send(cmdDisable, 0)
 }
-// If enabled, calls to t.Trigger() manually update lastExec 
+
+// If enabled, calls to t.Reset() manually update lastExec 
 // and return the current version.
-// If disabled, t.Trigger() returns -1, 
+// If disabled, t.Reset() returns -1, 
 // with no changes in lastExec
-func (t *SoftTimer) Trigger() int {
-	ch := make(chan int, 1)
-	t.ctrlCh <- command{typ: cmdTrigger, tempCh: ch}
-	return <-ch
+func (t *SoftTimer) Reset() int {
+	return t.send(cmdReset, 0)
 }
+
 func (t *SoftTimer) Close() {
-	t.ctrlCh <- command{typ: cmdClose}
-	t.wg.Wait()
-	close(t.C)
+	if(t.closed.CompareAndSwap(0, 1)) {
+		close(t.done)
+		t.ctrlCh <- command{typ: cmdClose}
+		t.wg.Wait()
+		close(t.C)
+	}
+}
+
+func (t *SoftTimer) killed() bool {
+	select{
+	case <-t.done:
+		return true
+	default:
+		return false
+	}
 }
 
 func (t *SoftTimer) doCmd(cmd command) {
@@ -92,7 +125,7 @@ func (t *SoftTimer) doCmd(cmd command) {
 		t.enabled = false
 		cmd.tempCh <- 0
 
-	case cmdTrigger:
+	case cmdReset:
 		if t.enabled {
 			t.update()
 			cmd.tempCh <- t.version
@@ -101,7 +134,6 @@ func (t *SoftTimer) doCmd(cmd command) {
 		}
 
 	case cmdClose:
-		t.closed = true
 	}
 }
 
@@ -110,7 +142,7 @@ func (t *SoftTimer) doCmd(cmd command) {
 func (t *SoftTimer) loop() {
 	defer t.wg.Done()
 	for {
-		if t.closed { return }
+		if(t.killed()) { return }
 		if !t.enabled {
 			// timer disabled
 			t.doCmd(<-t.ctrlCh)
@@ -125,13 +157,14 @@ func (t *SoftTimer) loop() {
 		}
 
 		sleepTime := t.interval - elapsed
+		timer := time.NewTimer(sleepTime)
 		select {
-		case <-time.After(sleepTime):
+		case <-timer.C:
 			// wake and loop
 		case cmd := <-t.ctrlCh:
 			t.doCmd(cmd)
 		}
-
+		timer.Stop()
 	}
 }
 
