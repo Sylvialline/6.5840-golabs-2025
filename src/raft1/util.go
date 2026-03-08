@@ -7,7 +7,7 @@ import (
 )
 
 // Debugging
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) {
 	if Debug {
@@ -33,4 +33,13 @@ func testSend[T any](ch chan T, s T) bool {
 	default:
 		return false
 	}
+}
+
+func (s RaftState) String() string {
+	return [...]string{
+		"any",
+		"follower",
+		"candidate",
+		"leader",
+	}[s]
 }

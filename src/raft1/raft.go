@@ -271,9 +271,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 // AppendEntries RPC sender.
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	DPrintf("AE: %v -> %v | MOUNT --- args.Term = %v", rf.me, server, args.Term)
+	start := time.Now()
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	duration := time.Since(start).Microseconds()
 	if ok {
+		DPrintf("AE: %v -> %v | SUCCESS(%vμs) --- reply.Term = %v, reply.Success = %v",
+		 rf.me, server, duration, reply.Term, reply.Success)
 		rf.toFollower(reply.Term, Any, false)
+	} else {
+		DPrintf("AE: %v -> %v | FAIL(%vμs)", rf.me, server, duration)
 	}
 	return ok
 }
@@ -583,6 +590,7 @@ func (rf *Raft) toCandidate() {
 		rf.currentTerm = term
 		rf.state = Candidate
 		rf.votedFor = rf.me
+		DPrintf("Server %v becomes candidate in term %v", rf.me, rf.currentTerm)
 
 		// prepare args
 		lastLogIndex := lastIndex(rf.log)
@@ -654,6 +662,7 @@ func (rf *Raft) toLeader() {
 		rf.matchIndex[i] = 0 // match at index 0
 	}
 
+	DPrintf("Server %v becomes leader in term %v", rf.me, rf.currentTerm)
 	rf.timer.Enable(int(rf.currentTerm))
 }
 
@@ -686,4 +695,5 @@ func (rf *Raft) toFollower(term termT, who RaftState, locked bool) {
 		rf.votedFor = -1
 	}
 	rf.timer.Disable()
+	DPrintf("Server %v becomes follower in term %v by %v", rf.me, rf.currentTerm, who.String())
 }
