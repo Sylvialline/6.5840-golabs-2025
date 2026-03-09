@@ -239,11 +239,33 @@ type AppendEntriesReply struct {
 	Term termT
 	// 3B
 	Success bool
+	// 3C (Fast Backup)
+	XIndex indexT
+	XTerm  termT
+}
+
+// find the largest index i <= x such that a[i].term <= k
+// a[] must be sorted in non-decreasing order
+func findLE(a []logEntry, x int, k termT) int {
+	l, r, res := 0, min(len(a)-1, x) , -1
+	if a[r].Term <= k {
+		return r
+	}
+	for l <= r {
+		mid := (l+r) >> 1
+		if a[mid].Term <= k {
+			res = mid
+			l = mid + 1
+		} else {
+			r = mid - 1
+		}
+	}
+	return res
 }
 
 // AppendEntries RPC handler.
 // Sender is a leader.
-// Increase beats, check consistency, append entries
+// Check consistency (with fast backup), append entries
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -257,6 +279,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if lastIndex(rf.log) < args.PrevLogIndex ||
 	   rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		// do not consistent
+		x := int(args.PrevLogIndex)
+		k := args.PrevLogTerm
+		reply.XIndex = indexT(findLE(rf.log, x, k))
+		reply.XTerm = rf.log[reply.XIndex].Term
 		return
 	}
 	rf.log = rf.log[:args.PrevLogIndex+1] // trunc first: [0, prev]
@@ -449,7 +475,11 @@ func (rf *Raft) aeSender(server int, args *AppendEntriesArgs, ch chan bool) {
 		rf.commit()
 	} else {
 		// consistency check failed
-		rf.nextIndex[server] --
+		// fast backup
+		x := int(reply.XIndex)
+		k := reply.XTerm
+		idx := findLE(rf.log, x, k)
+		rf.nextIndex[server] = indexT(idx + 1)
 		testSend(ch, true) // try again
 	}
 }
