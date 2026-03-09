@@ -8,7 +8,9 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"cmp"
+	"fmt"
 	"math/rand"
 	"slices"
 	"sync"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	"6.5840/tester1"
@@ -95,6 +98,7 @@ type Raft struct {
 	beats int // count of heartbeats from leader, zeroed each tick
 
 	// 3B
+	// not protected by mu
 	applyNotify chan indexT
 	aeChs       []chan bool // false means killed
 }
@@ -115,40 +119,48 @@ func (rf *Raft) GetState() (int, bool) {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
+// Caller must hold mu
 func (rf *Raft) persist() {
 	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if len(data) < 1 { // bootstrap without any state?
+		// first boot
 		return
 	}
 	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	var currentTerm termT
+	var votedFor idT
+	var log []logEntry
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&currentTerm) != nil ||
+	   d.Decode(&votedFor)    != nil ||
+		 d.Decode(&log)         != nil {
+		fmt.Printf("readPersist: failed")
+		return
+	}
+	rf.currentTerm = currentTerm
+	rf.votedFor    = votedFor
+	rf.log         = log
 }
 
 // how many bytes in Raft's persisted log?
 func (rf *Raft) PersistBytes() int {
+	// ? I don't think mu.Lock() is needed
+	// ? What's this method for?
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.persister.RaftStateSize()
@@ -190,6 +202,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	reply.VoteGranted = false
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -269,6 +282,7 @@ func findLE(a []logEntry, x int, k termT) int {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	reply.Success = false
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -280,10 +294,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if len(rf.log) <= int(args.PrevLogIndex) ||
 	   rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		// do not consistent
-		x := int(args.PrevLogIndex)
-		k := args.PrevLogTerm
-		reply.XIndex = indexT(findLE(rf.log, x, k))
-		reply.XTerm = rf.log[reply.XIndex].Term
+		// x := int(args.PrevLogIndex)
+		// k := args.PrevLogTerm
+		// reply.XIndex = indexT(findLE(rf.log, x, k))
+		// reply.XTerm = rf.log[reply.XIndex].Term
 		return
 	}
 	rf.log = rf.log[:args.PrevLogIndex+1] // trunc first: [0, prev]
@@ -334,6 +348,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 		Term: term,
 	})
+	rf.persist()
 	rf.mu.Unlock()
 	
 	rf.timer.Trigger()
@@ -358,7 +373,7 @@ func (rf *Raft) Kill() {
 	// Terminate heartbeatSender
 	rf.timer.Close()
 	// Terminate applier
-	close(rf.applyNotify)
+	rf.applyNotify <- -1
 	// Terminate aeSenders
 	rf.broadcast(false)
 }
@@ -392,6 +407,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	// From now on, rf.mu needs to be held when use
+	// lock protected fields of rf
+
 	rf.goroutineInit()
 
 	return rf
@@ -406,7 +424,8 @@ func (rf *Raft) ticker() {
 			if rf.state == Leader {
 				// allow leader to degrade when no one could
 				// be connected during a ElectionTimeout
-				// MAKE THE TESTER HAPPY (not sure if it's desired)
+				// MAKE THE TESTER(TestReElection3A) HAPPY
+				// (not sure if it's desired)
 				rf.state = Follower
 			}
 			// a leader election should be started.
@@ -441,6 +460,8 @@ func (rf *Raft) bootInit() {
 	rf.log = append(rf.log, logEntry{}) // might be overwritten by readPersist()
 	rf.applyNotify = make(chan indexT, 1)
 	rf.aeChs = make([]chan bool, rf.n)
+	rf.nextIndex = make([]indexT, rf.n)
+	rf.matchIndex = make([]indexT, rf.n)
 
 }
 
@@ -483,6 +504,7 @@ func median[T cmp.Ordered](a []T) T {
 // Return when killed
 func (rf *Raft) applier() {
 	for i := range(rf.applyNotify) {
+		if i == -1 { return }
 		rf.mu.Lock()
 		i = rf.commitIndex
 		rf.mu.Unlock()
@@ -502,9 +524,9 @@ func (rf *Raft) applier() {
 	}
 }
 
-// called by leader
-// calculate new commitIndex
-// caller must hold mu
+// called by leader.
+// calculate new commitIndex.
+// caller must hold mu.
 func (rf *Raft) commit() {
 	rf.matchIndex[rf.me] = lastIndex(rf.log) // COUNT YOURSELF!
 	N := median(rf.matchIndex)
@@ -517,8 +539,8 @@ func (rf *Raft) commit() {
 	}
 }
 
-// AppendEntries RPC sender for each server
-// Return when killed (on a false signal)
+// AppendEntries RPC sender for each server.
+// Return when killed (on a false signal).
 func (rf *Raft) aeSender(server int) {
 	ch := rf.aeChs[server]
 	for b := range(ch) {
@@ -564,18 +586,21 @@ func (rf *Raft) aeSender(server int) {
 		} else {
 			// consistency check failed
 			// fast backup
-			x := int(reply.XIndex)
-			k := reply.XTerm
-			idx := findLE(rf.log, x, k)
-			rf.nextIndex[server] = indexT(idx + 1)
-			// rf.nextIndex[server] --
-			ch <- true // try again
+			// x := int(reply.XIndex)
+			// k := reply.XTerm
+			// idx := findLE(rf.log, x, k)
+			// rf.nextIndex[server] = indexT(idx + 1)
+			rf.nextIndex[server] --
+			select{
+			case ch <- true: // try again
+			default:
+			}
 		}
 		rf.mu.Unlock()
 	}
 }
 
-// send true/false to all aeChs
+// send true/false to all aeChs,
 // used to send heartbeats/AEs/kill signals
 func (rf *Raft) broadcast(b bool) {
 	for i := 0; i < rf.n; i++ {
@@ -630,6 +655,7 @@ func (rf *Raft) toCandidate() {
 		rf.currentTerm = term
 		rf.state = Candidate
 		rf.votedFor = rf.me
+		rf.persist()
 
 		// prepare args
 		lastLogIndex := lastIndex(rf.log)
@@ -637,7 +663,7 @@ func (rf *Raft) toCandidate() {
 			Term: term,
 			CandidateId: rf.me,
 			LastLogIndex: lastLogIndex,
-			LastLogTerm: termT(rf.log[lastLogIndex].Term),
+			LastLogTerm: rf.log[lastLogIndex].Term,
 		}
 		rf.mu.Unlock()
 
@@ -694,8 +720,6 @@ func (rf *Raft) toLeader() {
 	// transfer to leader
 	rf.state = Leader
 	
-	rf.nextIndex = make([]indexT, rf.n)
-	rf.matchIndex = make([]indexT, rf.n)
 	for i := 0; i < rf.n; i++ {
 		rf.nextIndex[i] = indexT(len(rf.log))
 		rf.matchIndex[i] = 0 // match at index 0
@@ -714,6 +738,9 @@ func (rf *Raft) toFollower(term termT, who RaftState, locked bool) {
 	if !locked {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
+		defer rf.persist()
+		// if locked, perisistence must be done by the caller
+		// otherwise, done by toFollower()
 	}
 	if rf.state == Candidate && who == Leader {
 		if rf.currentTerm > term {
