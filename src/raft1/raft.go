@@ -214,7 +214,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 // RequestVote RPC sender. Goroutine.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, replyCh chan RequestVoteReply) {
+// Reply is sent to replyCh, and rvSender do not process it.
+func (rf *Raft) rvSender(server int, args *RequestVoteArgs, replyCh chan RequestVoteReply) {
 	reply := RequestVoteReply{}
 	ok := rf.peers[server].Call("Raft.RequestVote", args, &reply)
 	if ok {
@@ -251,7 +252,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		return
 	}
-	rf.beats++
 	rf.toFollower(args.Term, Leader, true)
 	reply.Term = rf.currentTerm
 	if lastIndex(rf.log) < args.PrevLogIndex ||
@@ -564,15 +564,8 @@ func (rf *Raft) toCandidate() {
 	for {
 		term := i
 		rf.mu.Lock()
-		if rf.state == Leader {
-			// L->C not allowed
-			rf.mu.Unlock()
-			i, ok = <-rf.candidateCh
-			if !ok { return }
-			continue
-		}
-		if rf.currentTerm >= term {
-			// obsolete election
+		if rf.state == Leader ||    // L->C not allowed
+		   rf.currentTerm >= term { // obsolete election
 			rf.mu.Unlock()
 			i, ok = <-rf.candidateCh
 			if !ok { return }
@@ -599,7 +592,7 @@ func (rf *Raft) toCandidate() {
 		replyCh := make(chan RequestVoteReply, chanVolume)
 		for i := 0; i < rf.n; i++ {
 			if i == int(rf.me) { continue }
-			go rf.sendRequestVote(i, &args, replyCh)
+			go rf.rvSender(i, &args, replyCh)
 		}
 
 		// count votes
@@ -629,7 +622,7 @@ func (rf *Raft) toCandidate() {
 		}
 		if votes != -1 {
 			// won the election
-			rf.toLeader()
+			rf.toLeader(term)
 		}
 		// wait for another election
 		i, ok = <-rf.candidateCh
@@ -641,10 +634,10 @@ func (rf *Raft) toCandidate() {
 // start to send heartbeat
 // Including leader initialization
 // Valid transfer: C->L
-func (rf *Raft) toLeader() {
+func (rf *Raft) toLeader(term termT) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.state != Candidate { return }
+	if rf.state != Candidate || rf.currentTerm != term { return }
 	// transfer to leader
 	rf.state = Leader
 	
@@ -670,7 +663,7 @@ func (rf *Raft) toFollower(term termT, who RaftState, locked bool) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
 	}
-	if rf.state == Candidate && who == Leader {
+	if rf.state == Candidate && who == Leader || rf.state == Follower {
 		if rf.currentTerm > term {
 			return
 		}
@@ -681,6 +674,11 @@ func (rf *Raft) toFollower(term termT, who RaftState, locked bool) {
 	}
 	// transfer to follower
 	rf.state = Follower
+	// if who == Leader {
+	// 	rf.beats++
+	// }
+	rf.beats++
+
 	// when C->F, may be the case where rf.currentTerm == term,
 	// in which we cannot initialize votedFor
 	if rf.currentTerm < term {
