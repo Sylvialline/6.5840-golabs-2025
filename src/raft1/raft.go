@@ -76,7 +76,7 @@ type Raft struct {
 
 	// volatile on all
 	commitIndex indexT
-	lastApplied indexT // not protected by mu
+	lastApplied indexT
 
 
 	// volatile on leaders
@@ -348,6 +348,8 @@ func (rf *Raft) Kill() {
 	close(rf.applyNotify)
 	// Terminate aeWorkers
 	rf.broadcast(false)
+
+	DPrintf(rf.String())
 }
 
 func (rf *Raft) killed() bool {
@@ -487,7 +489,6 @@ func (rf *Raft) aeSender(server int, args *AppendEntriesArgs, ch chan bool) {
 // Goroutine listening on applyNotify
 // Applies newly committed entries to applyCh
 // (assume applyCh to be very congested)
-// Owns rf.lastApplied (so no lock when use it)
 // Return when killed
 func (rf *Raft) applier() {
 	for i := range(rf.applyNotify) {
@@ -507,7 +508,10 @@ func (rf *Raft) applier() {
 				CommandIndex: k + int(rf.lastApplied + 1),
 			}
 		}
-		rf.lastApplied = i
+		rf.mu.Lock()
+		// Raft.String() also use it
+		rf.lastApplied = i 
+		rf.mu.Unlock()
 	}
 }
 
@@ -603,10 +607,10 @@ func (rf *Raft) toCandidate() {
 		}
 		// start election
 		// transfer to candidate
+		DPrintf("S%v in T%v becomes candidate in T%v", rf.me, rf.currentTerm, term)
 		rf.currentTerm = term
 		rf.state = Candidate
 		rf.votedFor = rf.me
-		DPrintf("Server %v becomes candidate in term %v", rf.me, rf.currentTerm)
 
 		// prepare args
 		lastLogIndex := lastIndex(rf.log)
@@ -678,13 +682,13 @@ func (rf *Raft) toLeader(term termT) {
 		rf.matchIndex[i] = 0 // match at index 0
 	}
 
-	DPrintf("Server %v becomes leader in term %v", rf.me, rf.currentTerm)
+	DPrintf("S%v becomes leader in T%v", rf.me, rf.currentTerm)
 	rf.timer.Enable(int(rf.currentTerm))
 }
 
 
 // locked caller: AppendEntries(), RequestVote()
-// unlocked caller: toCandidate(), sendAppendEntries()
+// unlocked caller: toCandidate(), aeSender()
 // cease to send heartbeat
 // argument who indicates who wants me to become follower
 // valid transfers: F->F, C->F, L->F
@@ -702,6 +706,15 @@ func (rf *Raft) toFollower(term termT, who RaftState, locked bool) {
 			return
 		}
 	}
+
+	if rf.state == Follower && rf.currentTerm == term {
+		DPrintf("S%v in T%v gets a beat",
+		 rf.me, rf.currentTerm)
+	} else {
+		DPrintf("S%v in T%v becomes follower in T%v by %v",
+		 rf.me, rf.currentTerm, term, who.String())
+	}
+
 	// transfer to follower
 	rf.state = Follower
 	// if who == Leader {
@@ -716,5 +729,5 @@ func (rf *Raft) toFollower(term termT, who RaftState, locked bool) {
 		rf.votedFor = -1
 	}
 	rf.timer.Disable()
-	DPrintf("Server %v becomes follower in term %v by %v", rf.me, rf.currentTerm, who.String())
+	
 }
