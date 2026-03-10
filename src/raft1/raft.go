@@ -190,12 +190,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.VoteGranted = false
+	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
 		return
 	}
-	rf.toFollower(args.Term, Candidate, true)
-	reply.Term = rf.currentTerm
+	if args.Term > rf.currentTerm {
+		rf.toFollower(args.Term)
+		reply.Term = rf.currentTerm
+	}
+
 	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
 		return
 	}
@@ -211,6 +214,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	rf.votedFor = args.CandidateId
 	reply.VoteGranted = true
+	rf.beats++ // only when grant vote
 }
 
 // RequestVote RPC sender. Goroutine.
@@ -274,7 +278,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		return
 	}
-	rf.toFollower(args.Term, Leader, true)
+	rf.toFollower(args.Term)
+	rf.beats++
 	reply.Term = rf.currentTerm
 	if lastIndex(rf.log) < args.PrevLogIndex ||
 	   rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
@@ -349,7 +354,7 @@ func (rf *Raft) Kill() {
 	// Terminate aeWorkers
 	rf.broadcast(false)
 
-	DPrintf(rf.String())
+	// DPrintf(rf.String())
 }
 
 func (rf *Raft) killed() bool {
@@ -463,7 +468,10 @@ func (rf *Raft) aeSender(server int, args *AppendEntriesArgs, ch chan bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.toFollower(reply.Term, Any, true)
+	if reply.Term > rf.currentTerm {
+		rf.toFollower(reply.Term)
+		rf.beats++
+	}
 	if rf.state != Leader || rf.currentTerm != args.Term { 
 		// discard the reply if term changed, even if it's leader again
 		// because uncommitted entries can be overwritten by other leaders
@@ -643,7 +651,10 @@ func (rf *Raft) toCandidate() {
 					}
 				} else if reply.Term > term {
 					// someone is on a larger term than I'm competing for leader now
-					rf.toFollower(reply.Term, Any, false)
+					rf.mu.Lock()
+					rf.toFollower(reply.Term)
+					rf.beats++
+					rf.mu.Unlock()
 					votes = -1
 					break Inner
 				}
@@ -687,40 +698,13 @@ func (rf *Raft) toLeader(term termT) {
 }
 
 
-// locked caller: AppendEntries(), RequestVote()
-// unlocked caller: toCandidate(), aeSender()
-// cease to send heartbeat
-// argument who indicates who wants me to become follower
-// valid transfers: F->F, C->F, L->F
-func (rf *Raft) toFollower(term termT, who RaftState, locked bool) {
-	if !locked {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-	}
-	if rf.state == Candidate && who == Leader || rf.state == Follower {
-		if rf.currentTerm > term {
-			return
-		}
-	} else {
-		if rf.currentTerm >= term {
-			return
-		}
-	}
+// Callers: AppendEntries(), RequestVote(), 
+// toCandidate(), aeSender().
+// Cease to send heartbeat.
+// Caller must hold mu.
+func (rf *Raft) toFollower(term termT) {
 
-	if rf.state == Follower && rf.currentTerm == term {
-		DPrintf("S%v in T%v gets a beat",
-		 rf.me, rf.currentTerm)
-	} else {
-		DPrintf("S%v in T%v becomes follower in T%v by %v",
-		 rf.me, rf.currentTerm, term, who.String())
-	}
-
-	// transfer to follower
 	rf.state = Follower
-	// if who == Leader {
-	// 	rf.beats++
-	// }
-	rf.beats++
 
 	// when C->F, may be the case where rf.currentTerm == term,
 	// in which we cannot initialize votedFor
