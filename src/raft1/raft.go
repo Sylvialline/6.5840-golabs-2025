@@ -7,14 +7,14 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
-	//	"bytes"
+	"bytes"
 	"math/rand"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	"6.5840/tester1"
@@ -94,6 +94,7 @@ type Raft struct {
 	beats int // count of heartbeats from leader, zeroed each tick
 
 	// 3B
+	// not protected by mu
 	applyNotify chan indexT
 	aeChs       []chan bool // false means killed
 }
@@ -114,40 +115,47 @@ func (rf *Raft) GetState() (int, bool) {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
+// Caller must hold mu
 func (rf *Raft) persist() {
 	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if len(data) < 1 { // bootstrap without any state?
+		// first boot
 		return
 	}
 	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	var currentTerm termT
+	var votedFor idT
+	var log []logEntry
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&currentTerm) != nil ||
+	   d.Decode(&votedFor)    != nil ||
+		 d.Decode(&log)         != nil {
+		panic("readPersist: decode error")
+	}
+	rf.currentTerm = currentTerm
+	rf.votedFor    = votedFor
+	rf.log         = log
 }
 
 // how many bytes in Raft's persisted log?
 func (rf *Raft) PersistBytes() int {
+	// ? I don't think mu.Lock() is needed
+	// ? What's this method for?
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.persister.RaftStateSize()
@@ -189,6 +197,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	reply.VoteGranted = false
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
@@ -273,6 +282,7 @@ func findLE(a []logEntry, x int, k termT) int {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	reply.Success = false
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -326,6 +336,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 		Term: term,
 	})
+	rf.persist()
 	rf.mu.Unlock()
 	
 	rf.timer.Reset()
@@ -350,7 +361,7 @@ func (rf *Raft) Kill() {
 	// Terminate aeTicker
 	rf.timer.Close()
 	// Terminate applier
-	close(rf.applyNotify)
+	rf.applyNotify <- -1
 	// Terminate aeWorkers
 	rf.broadcast(false)
 
@@ -385,6 +396,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	// From now on, rf.mu needs to be held when use
+	// lock protected fields of rf
 
 	rf.goroutineInit()
 
@@ -432,6 +446,8 @@ func (rf *Raft) bootInit() {
 	rf.log = append(rf.log, logEntry{}) // might be overwritten by readPersist()
 	rf.applyNotify = make(chan indexT, 1)
 	rf.aeChs = make([]chan bool, rf.n)
+	rf.nextIndex = make([]indexT, rf.n)
+	rf.matchIndex = make([]indexT, rf.n)
 
 }
 
@@ -470,6 +486,7 @@ func (rf *Raft) aeSender(server int, args *AppendEntriesArgs, ch chan bool) {
 
 	if reply.Term > rf.currentTerm {
 		rf.toFollower(reply.Term)
+		rf.persist()
 		rf.beats++
 	}
 	if rf.state != Leader || rf.currentTerm != args.Term { 
@@ -500,6 +517,7 @@ func (rf *Raft) aeSender(server int, args *AppendEntriesArgs, ch chan bool) {
 // Return when killed
 func (rf *Raft) applier() {
 	for i := range(rf.applyNotify) {
+		if i == -1 { return }
 		rf.mu.Lock()
 		i = rf.commitIndex
 		if i <= rf.lastApplied {
@@ -523,9 +541,9 @@ func (rf *Raft) applier() {
 	}
 }
 
-// called by leader
-// calculate new commitIndex
-// caller must hold mu
+// called by leader.
+// calculate new commitIndex.
+// caller must hold mu.
 func (rf *Raft) commit() {
 	rf.matchIndex[rf.me] = lastIndex(rf.log) // COUNT YOURSELF!
 	N := median(rf.matchIndex)
@@ -566,7 +584,7 @@ func (rf *Raft) aeWorker(server int) {
 	}
 }
 
-// send true/false to all aeChs
+// send true/false to all aeChs,
 // used to send heartbeats/AEs/kill signals
 func (rf *Raft) broadcast(b bool) {
 	for i := 0; i < rf.n; i++ {
@@ -619,6 +637,7 @@ func (rf *Raft) toCandidate() {
 		rf.currentTerm = term
 		rf.state = Candidate
 		rf.votedFor = rf.me
+		rf.persist()
 
 		// prepare args
 		lastLogIndex := lastIndex(rf.log)
@@ -653,6 +672,7 @@ func (rf *Raft) toCandidate() {
 					// someone is on a larger term than I'm competing for leader now
 					rf.mu.Lock()
 					rf.toFollower(reply.Term)
+					rf.persist()
 					rf.beats++
 					rf.mu.Unlock()
 					votes = -1
@@ -686,8 +706,6 @@ func (rf *Raft) toLeader(term termT) {
 	// transfer to leader
 	rf.state = Leader
 	
-	rf.nextIndex = make([]indexT, rf.n)
-	rf.matchIndex = make([]indexT, rf.n)
 	for i := 0; i < rf.n; i++ {
 		rf.nextIndex[i] = indexT(len(rf.log))
 		rf.matchIndex[i] = 0 // match at index 0
