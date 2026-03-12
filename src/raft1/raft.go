@@ -558,7 +558,7 @@ func (rf *Raft) aeWorker(server int) {
 		args.LeaderId = rf.me
 		args.PrevLogIndex = next - 1
 		args.PrevLogTerm = rf.log[next - 1].Term
-		args.Entries = rf.log[next:]
+		args.Entries = slices.Clone(rf.log[next:])
 		args.LeaderCommit = rf.commitIndex
 		rf.mu.Unlock()
 
