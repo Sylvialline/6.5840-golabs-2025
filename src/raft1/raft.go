@@ -8,7 +8,6 @@ package raft
 
 import (
 	"bytes"
-	"math/rand"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -24,14 +23,7 @@ import (
 
 const (
 	HeartbeatInterval time.Duration = 100 * time.Millisecond + time.Microsecond
-	ElectionTimeoutLower time.Duration = 300 * time.Millisecond
-	ElectionTimeoutUpper time.Duration = 600 * time.Millisecond
 )
-
-func randomElectionTimeout() time.Duration {
-	diff := ElectionTimeoutUpper - ElectionTimeoutLower
-	return ElectionTimeoutLower + time.Duration(rand.Int63n(int64(diff)))
-}
 
 const chanVolume = 100
 
@@ -172,144 +164,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 
-// RPCs
-
-// RequestVote RPC arguments structure.
-type RequestVoteArgs struct {
-	// 3A
-	Term termT
-	CandidateId idT
-	// 3B
-	LastLogIndex indexT
-	LastLogTerm termT
-}
-
-// RequestVote RPC reply structure.
-type RequestVoteReply struct {
-	// 3A
-	Term termT
-	VoteGranted bool
-}
-
-// RequestVote RPC handler.
-// Sender is a candidate.
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (3A, 3B).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	defer rf.persist()
-	reply.VoteGranted = false
-	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm {
-		return
-	}
-	if args.Term > rf.currentTerm {
-		rf.toFollower(args.Term)
-		reply.Term = rf.currentTerm
-	}
-
-	if rf.votedFor != -1 && rf.votedFor != args.CandidateId {
-		return
-	}
-	// election restriction
-	myLastIndex := lastIndex(rf.log)
-	myLastTerm := rf.log[myLastIndex].Term
-	if args.LastLogTerm < myLastTerm  {
-		return
-	}
-	if args.LastLogTerm == myLastTerm && 
-	   args.LastLogIndex < myLastIndex {
-		return
-	}
-	rf.votedFor = args.CandidateId
-	reply.VoteGranted = true
-	rf.beats++ // only when grant vote
-}
-
-// RequestVote RPC sender. Goroutine.
-// Reply is sent to replyCh, and rvSender do not process it.
-func (rf *Raft) rvSender(server int, args *RequestVoteArgs, replyCh chan RequestVoteReply) {
-	reply := RequestVoteReply{}
-	ok := rf.peers[server].Call("Raft.RequestVote", args, &reply)
-	if ok {
-		replyCh <- reply
-	}
-}
-
-type AppendEntriesArgs struct {
-	// 3A
-	Term termT
-	// 3B
-	LeaderId idT
-	PrevLogIndex indexT
-	PrevLogTerm termT
-	Entries []logEntry
-	LeaderCommit indexT
-}
-
-type AppendEntriesReply struct {
-	// 3A
-	Term termT
-	// 3B
-	Success bool
-	// 3C (Fast Backup)
-	XIndex indexT
-	XTerm  termT
-}
-
-// find the largest index i <= x such that a[i].term <= k
-// a[] must be sorted in non-decreasing order
-func findLE(a []logEntry, x int, k termT) int {
-	l, r, res := 0, min(len(a)-1, x) , -1
-	if a[r].Term <= k {
-		return r
-	}
-	for l <= r {
-		mid := (l+r) >> 1
-		if a[mid].Term <= k {
-			res = mid
-			l = mid + 1
-		} else {
-			r = mid - 1
-		}
-	}
-	return res
-}
-
-// AppendEntries RPC handler.
-// Sender is a leader.
-// Check consistency (with fast backup), append entries
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	defer rf.persist()
-	reply.Success = false
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
-		return
-	}
-	rf.toFollower(args.Term)
-	rf.beats++
-	reply.Term = rf.currentTerm
-	if lastIndex(rf.log) < args.PrevLogIndex ||
-	   rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		// do not consistent
-		x := int(args.PrevLogIndex)
-		k := args.PrevLogTerm
-		reply.XIndex = indexT(findLE(rf.log, x, k))
-		reply.XTerm = rf.log[reply.XIndex].Term
-		return
-	}
-	rf.log = rf.log[:args.PrevLogIndex+1] // trunc first: [0, prev]
-	rf.log = append(rf.log, args.Entries...)
-	reply.Success = true
-	N := min(args.LeaderCommit, lastIndex(rf.log))
-	if N > rf.commitIndex {
-		rf.commitIndex = N
-		testSend(rf.applyNotify, N)
-	}
-}
-
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -405,30 +259,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-
-func (rf *Raft) rvTicker() {
-	for !rf.killed() {
-		// Your code here (3A)
-		nextTerm := termT(-1)
-
-		rf.mu.Lock()
-		if rf.state != Leader && rf.beats == 0 {
-			// a leader election should be started.
-			nextTerm = rf.currentTerm + 1
-		}
-		rf.beats = 0
-		rf.mu.Unlock()
-
-		if nextTerm != -1 {
-			rf.candidateCh <- nextTerm
-		}
-		// pause for a random amount of time between
-		//  `ElectionTimeoutLower` and `ElectionTimeoutUpper`
-		time.Sleep(randomElectionTimeout())
-	}
-	// Terminate goroutine toCandidate()
-	close(rf.candidateCh) 
-}
 // init methods
 
 func (rf *Raft) bootInit() {
@@ -471,46 +301,6 @@ func (rf *Raft) goroutineInit() {
 }
 
 
-// my methods for 3B
-
-// Goroutine that send an AppendEntries to server
-// and deals with the reply.
-// When redo is needed, send true to ch.
-func (rf *Raft) aeSender(server int, args *AppendEntriesArgs, ch chan bool) {
-	reply := &AppendEntriesReply{}
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if !ok { return }
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if reply.Term > rf.currentTerm {
-		rf.toFollower(reply.Term)
-		rf.persist()
-		rf.beats++
-	}
-	if rf.state != Leader || rf.currentTerm != args.Term { 
-		// discard the reply if term changed, even if it's leader again
-		// because uncommitted entries can be overwritten by other leaders
-		return
-	}
-
-	if reply.Success {
-		l := len(args.Entries)
-		rf.matchIndex[server] = args.PrevLogIndex + indexT(l)
-		rf.nextIndex[server] = rf.matchIndex[server] + 1
-		rf.commit()
-	} else {
-		// consistency check failed
-		// fast backup
-		x := int(reply.XIndex)
-		k := reply.XTerm
-		idx := findLE(rf.log, x, k)
-		rf.nextIndex[server] = indexT(idx + 1)
-		testSend(ch, true) // try again
-	}
-}
-
 // Goroutine listening on applyNotify
 // Applies newly committed entries to applyCh
 // (assume applyCh to be very congested)
@@ -552,169 +342,6 @@ func (rf *Raft) commit() {
 		testSend(rf.applyNotify, N)
 	}
 }
-
-// AppendEntries RPC manager for `server`.
-// Construct the args and limit the amount of AEs
-// sending to `server`.
-// Call aeSender to send AE and handle its reply.
-// Return when killed (on a false signal)
-func (rf *Raft) aeWorker(server int) {
-	ch := rf.aeChs[server]
-	for b := range(ch) {
-		if !b { return }
-		args := &AppendEntriesArgs{}
-		rf.mu.Lock()
-		if rf.state != Leader {
-			// must not send AEs with new term but as follower
-			rf.mu.Unlock()
-			continue
-		}
-		term := rf.currentTerm
-		next := rf.nextIndex[server]
-
-		args.Term = term
-		args.LeaderId = rf.me
-		args.PrevLogIndex = next - 1
-		args.PrevLogTerm = rf.log[next - 1].Term
-		args.Entries = slices.Clone(rf.log[next:])
-		args.LeaderCommit = rf.commitIndex
-		rf.mu.Unlock()
-
-		go rf.aeSender(server, args, ch)
-	}
-}
-
-// send true/false to all aeChs,
-// used to send heartbeats/AEs/kill signals
-func (rf *Raft) broadcast(b bool) {
-	for i := 0; i < rf.n; i++ {
-		if i == int(rf.me) { continue }
-		if b {
-			testSend(rf.aeChs[i], true)
-		} else {
-			rf.aeChs[i] <- false
-		}
-	}
-}
-
-// my methods for 3A
-
-
-// Goroutine listening on rf.timer.C.
-// On every signal received from rf.timer.C, 
-// send a heartbeat to all peers.
-// Guaranteed to return when killed.
-func (rf *Raft) aeTicker() {
-	for range(rf.timer.C) {
-		rf.broadcast(true)
-	}
-}
-
-// Goroutine listening on candidateCh.
-// A `term` comes from candidateCh means the server
-// might want to become a candidate of term `term`.
-// Return when killed.
-// Methods that send to candidateCh: only ticker()
-// Valid transfers: F->C or C->C
-func (rf *Raft) toCandidate() {
-	i, ok := <-rf.candidateCh
-	if !ok { return }
-
-	Outer:
-	for {
-		term := i
-		rf.mu.Lock()
-		if rf.state == Leader ||    // L->C not allowed
-		   rf.currentTerm >= term { // obsolete election
-			rf.mu.Unlock()
-			i, ok = <-rf.candidateCh
-			if !ok { return }
-			continue
-		}
-		// start election
-		// transfer to candidate
-		DPrintf("S%v in T%v becomes candidate in T%v", rf.me, rf.currentTerm, term)
-		rf.currentTerm = term
-		rf.state = Candidate
-		rf.votedFor = rf.me
-		rf.persist()
-
-		// prepare args
-		lastLogIndex := lastIndex(rf.log)
-		args := RequestVoteArgs{
-			Term: term,
-			CandidateId: rf.me,
-			LastLogIndex: lastLogIndex,
-			LastLogTerm: rf.log[lastLogIndex].Term,
-		}
-		rf.mu.Unlock()
-
-		// send RVs
-		replyCh := make(chan RequestVoteReply, chanVolume)
-		for i := 0; i < rf.n; i++ {
-			if i == int(rf.me) { continue }
-			go rf.rvSender(i, &args, replyCh)
-		}
-
-		// count votes
-		// while listening on next term from candidateCh
-		votes := 1 // COUNT YOURSELF!
-		Inner:
-		for {
-			select {
-			case reply := <-replyCh:
-				if reply.VoteGranted {
-					votes++
-					if votes*2 > rf.n {
-						break Inner
-					}
-				} else if reply.Term > term {
-					// someone is on a larger term than I'm competing for leader now
-					rf.mu.Lock()
-					rf.toFollower(reply.Term)
-					rf.persist()
-					rf.beats++
-					rf.mu.Unlock()
-					votes = -1
-					break Inner
-				}
-
-			case i, ok = <-rf.candidateCh:
-				if !ok { return }
-				// timeout. start another election
-				continue Outer
-			}
-		}
-		if votes != -1 {
-			// won the election
-			rf.toLeader(term)
-		}
-		// wait for another election
-		i, ok = <-rf.candidateCh
-		if !ok { return }
-	}
-}
-
-// called by toCandidate()
-// start to send heartbeat
-// Including leader initialization
-// Valid transfer: C->L
-func (rf *Raft) toLeader(term termT) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.state != Candidate || rf.currentTerm != term { return }
-	// transfer to leader
-	rf.state = Leader
-	
-	for i := 0; i < rf.n; i++ {
-		rf.nextIndex[i] = indexT(len(rf.log))
-		rf.matchIndex[i] = 0 // match at index 0
-	}
-
-	DPrintf("S%v becomes leader in T%v", rf.me, rf.currentTerm)
-	rf.timer.Enable(int(rf.currentTerm))
-}
-
 
 // Callers: AppendEntries(), RequestVote(), 
 // toCandidate(), aeSender().
