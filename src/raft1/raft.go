@@ -75,20 +75,22 @@ type Raft struct {
 	nextIndex  []indexT
 	matchIndex []indexT
 
-	// 3A
+	// 3A & 3B
 	// not protected by mu
 	n           int // number of peers
 	candidateCh chan termT // buffer size = 1 makes the most sense
 	timer *softtimer.SoftTimer 
+	applyNotify chan indexT
+	aeChs       []chan bool // false means killed
 
 	// protected by mu
 	state RaftState
 	beats int // count of heartbeats from leader, zeroed each tick
 
-	// 3B
-	// not protected by mu
-	applyNotify chan indexT
-	aeChs       []chan bool // false means killed
+	// 3D: Snapshot
+	snapshot      []byte
+	snapshotIndex indexT
+	snapshotTerm  termT
 }
 
 // return currentTerm and whether this server
@@ -116,14 +118,16 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.snapshotIndex)
+	e.Encode(rf.snapshotTerm)
 
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, rf.snapshot)
 }
 
 
 // restore previously persisted state.
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 	if len(data) < 1 { // bootstrap without any state?
 		// first boot
 		return
@@ -132,16 +136,24 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm termT
 	var votedFor idT
 	var log []logEntry
+	var snapshotIndex indexT
+	var snapshotTerm termT
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	if d.Decode(&currentTerm) != nil ||
-	   d.Decode(&votedFor)    != nil ||
-		 d.Decode(&log)         != nil {
+	if d.Decode(&currentTerm)   != nil ||
+	   d.Decode(&votedFor)      != nil ||
+		 d.Decode(&log)           != nil ||
+		 d.Decode(&snapshotIndex) != nil ||
+		 d.Decode(&snapshotTerm)  != nil{
 		panic("readPersist: decode error")
 	}
 	rf.currentTerm = currentTerm
 	rf.votedFor    = votedFor
 	rf.log         = log
+	rf.snapshotIndex = snapshotIndex
+	rf.snapshotTerm  = snapshotTerm
+
+	rf.snapshot = snapshot
 }
 
 // how many bytes in Raft's persisted log?
@@ -153,15 +165,6 @@ func (rf *Raft) PersistBytes() int {
 	return rf.persister.RaftStateSize()
 }
 
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
-
-}
 
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -249,7 +252,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.bootInit()
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	rf.readPersist(persister.ReadRaftState(), persister.ReadSnapshot())
 
 	// From now on, rf.mu needs to be held when use
 	// lock protected fields of rf
@@ -265,6 +268,10 @@ func (rf *Raft) bootInit() {
 	rf.dead = 0
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+
+	rf.snapshotIndex = 0
+	rf.snapshotTerm = 0
+	rf.snapshot = nil
 
 	rf.state = Follower
 	rf.n = len(rf.peers)
