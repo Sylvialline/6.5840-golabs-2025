@@ -67,8 +67,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XTerm = rf.log[reply.XIndex].Term
 		return
 	}
-	rf.log = rf.log[:args.PrevLogIndex+1] // trunc first: [0, prev]
-	rf.log = append(rf.log, args.Entries...)
+	
+	// Under unreliable networks, an old AppendEntries request may arrive
+	// after newer entries have already been accepted.
+	// A stale request may roll back entries that should not be removed,
+	// potentially including committed ones,
+	// which is catastrophic (broken Leadership Completeness)
+	// if this follower is to be elected as a new leader afterwards.
+	newLog := rf.log[:args.PrevLogIndex+1]
+	newLog = append(newLog, args.Entries...)
+
+	myLastTerm := rf.log[len(rf.log)-1].Term
+	newLastTerm := newLog[len(newLog)-1].Term
+	if newLastTerm < myLastTerm ||
+	   newLastTerm == myLastTerm && len(newLog) < len(rf.log) {
+			// Stale reuqest
+			// Mimic the election restriction: let only a newer log to overwrite mine.
+			return
+		}
+	rf.log = newLog
 	reply.Success = true
 	N := min(args.LeaderCommit, lastIndex(rf.log))
 	if N > rf.commitIndex {
@@ -102,16 +119,31 @@ func (rf *Raft) aeSender(server int, args *AppendEntriesArgs, ch chan bool) {
 
 	if reply.Success {
 		l := len(args.Entries)
-		rf.matchIndex[server] = args.PrevLogIndex + indexT(l)
+		newMatch := args.PrevLogIndex + indexT(l)
+		if (rf.matchIndex[server] >= newMatch) {
+			// A successful reply may be stale under unreliable networks.
+			// Only move replication progress forward: never let an out-of-order
+			// old reply roll back matchIndex/nextIndex.
+			return
+		}
+		rf.matchIndex[server] = newMatch
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
 		rf.commit()
 	} else {
 		// consistency check failed
+		if rf.matchIndex[server] == lastIndex(rf.log) {
+			// Stale reply: this follower is already known to be fully caught up.
+			return
+		}
 		// fast backup
 		x := int(reply.XIndex)
 		k := reply.XTerm
-		idx := findLE(rf.log, x, k)
-		rf.nextIndex[server] = indexT(idx + 1)
+		newNext := indexT(findLE(rf.log, x, k) + 1)
+		if rf.nextIndex[server] <= newNext {
+			// Stale reply: backup progress is up-to-date
+			return
+		}
+		rf.nextIndex[server] = newNext
 		testSend(ch, true) // try again
 	}
 }
