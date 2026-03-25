@@ -1,9 +1,9 @@
 package raft
 
 import (
-	"strings"
+	// "strings"
 	"cmp"
-	"fmt"
+	// "fmt"
 	"log"
 	"slices"
 )
@@ -17,9 +17,22 @@ func DPrintf(format string, a ...interface{}) {
 	}
 }
 
-func lastIndex[T any](a []T) indexT {
-	return indexT(len(a) - 1)
+func lastOffset[T any](a []T) offsetT {
+	return offsetT(len(a) - 1)
 }
+
+func nextOffset[T any](a []T) offsetT {
+	return offsetT(len(a))
+}
+
+func lastTerm(log []logEntry) termT {
+	off := len(log) - 1
+	if off < 0 {
+		return -1
+	}
+	return log[off].Term
+}
+
 
 func median[T cmp.Ordered](a []T) T {
 	b := slices.Clone(a)
@@ -37,45 +50,45 @@ func testSend[T any](ch chan T, s T) bool {
 	}
 }
 
-func (s RaftState) String() string {
-	return [...]string{
-		"any",
-		"follower",
-		"candidate",
-		"leader",
-	}[s]
-}
+// func (s RaftState) String() string {
+// 	return [...]string{
+// 		"any",
+// 		"follower",
+// 		"candidate",
+// 		"leader",
+// 	}[s]
+// }
 
-func (rf *Raft) String() string {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+// func (rf *Raft) String() string {
+// 	rf.mu.Lock()
+// 	defer rf.mu.Unlock()
 
-	// build log summary
-	var logStr strings.Builder
-	for i := range rf.log {
-		logStr.WriteString(fmt.Sprintf("(%d,%v)", rf.log[i].Term, rf.log[i].Command))
-		if i != len(rf.log)-1 {
-			logStr.WriteString(" ")
-		}
-	}
+// 	// build log summary
+// 	var logStr strings.Builder
+// 	for i := range rf.log {
+// 		logStr.WriteString(fmt.Sprintf("(%d,%v)", rf.log[i].Term, rf.log[i].Command))
+// 		if i != len(rf.log)-1 {
+// 			logStr.WriteString(" ")
+// 		}
+// 	}
 
-	s := fmt.Sprintf(
-		"\nServer %d:\n T%d %v | commit=%d applied=%d | log=[%s]",
-		rf.me,
-		rf.currentTerm,
-		rf.state.String(),
-		rf.commitIndex,
-		rf.lastApplied,
-		logStr.String(),
-	)
+// 	s := fmt.Sprintf(
+// 		"\nServer %d:\n T%d %v | commit=%d applied=%d | log=[%s]",
+// 		rf.me,
+// 		rf.currentTerm,
+// 		rf.state.String(),
+// 		rf.commitIndex,
+// 		rf.lastApplied,
+// 		logStr.String(),
+// 	)
 
-	if rf.state == Leader {
-		s += fmt.Sprintf(
-			"\n | next=%v match=%v",
-			rf.nextIndex,
-			rf.matchIndex,
-		)
-	}
+// 	if rf.state == Leader {
+// 		s += fmt.Sprintf(
+// 			"\n | next=%v match=%v",
+// 			rf.nextIndex,
+// 			rf.matchIndex,
+// 		)
+// 	}
 
-	return s
-}
+// 	return s
+// }

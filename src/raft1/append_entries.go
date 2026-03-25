@@ -7,7 +7,7 @@ type AppendEntriesArgs struct {
 	// 3A
 	Term termT
 	// 3B
-	LeaderId idT
+	LeaderId idT // client redirection (not implemented)
 	PrevLogIndex indexT
 	PrevLogTerm termT
 	Entries []logEntry
@@ -24,16 +24,20 @@ type AppendEntriesReply struct {
 	XTerm  termT
 }
 
-// find the largest index i <= x such that a[i].term <= k
-// a[] must be sorted in non-decreasing order
-func findLE(a []logEntry, x int, k termT) int {
-	l, r, res := 0, min(len(a)-1, x) , -1
-	if a[r].Term <= k {
+// Find the largest offset i <= x such that rf.log[i].term <= k.
+// Returns -1 if rf.snapshotIndex is the only i.
+// Returns -2 if no such i.
+func (rf *Raft) findLE(x offsetT, k termT) offsetT {
+	var l   offsetT = -1
+	var r   offsetT = min(lastOffset(rf.log), x)
+	var res offsetT = -2
+
+	if rf.termAtOffset(r) <= k {
 		return r
 	}
 	for l <= r {
-		mid := (l+r) >> 1
-		if a[mid].Term <= k {
+		mid := (l+r) / 2
+		if rf.termAtOffset(mid) <= k {
 			res = mid
 			l = mid + 1
 		} else {
@@ -49,45 +53,73 @@ func findLE(a []logEntry, x int, k termT) int {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist()
+
 	reply.Success = false
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		return
 	}
+	
+	defer rf.persist()
+	
 	rf.toFollower(args.Term)
 	rf.beats++
 	reply.Term = rf.currentTerm
-	if lastIndex(rf.log) < args.PrevLogIndex ||
-	   rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		// do not consistent
-		x := int(args.PrevLogIndex)
+	
+	off := rf.toOffset(args.PrevLogIndex)
+	if off < -1 {
+		// Stage 2:
+		// An successful AE reply had been dropped, so nextIndex for 
+		// this follower failed to advance as it should do.
+		// During this time, follower's service created a new snapshot
+		// and advanced follower's snapshotIndex to surpass leader's nextIndex.
+		// Approach: truncate the overlapping part of args.Entries 
+		truncSize := int(-1 - off)
+		if truncSize > len(args.Entries) {
+			return
+		}
+		args.PrevLogIndex += indexT(truncSize)
+		args.PrevLogTerm = args.Entries[truncSize-1].Term
+		args.Entries = args.Entries[truncSize:]
+		off = -1
+	}
+	if lastOffset(rf.log) < off ||
+	   rf.termAtOffset(off) != args.PrevLogTerm {
+		// Stage 1: consistency check failed
+		x := off
 		k := args.PrevLogTerm
-		reply.XIndex = indexT(findLE(rf.log, x, k))
-		reply.XTerm = rf.log[reply.XIndex].Term
+		offRes := rf.findLE(x, k)
+		// The follower's log at least matches with the leader's
+		// at rf.snapshotIndex, in which case offRes gets -1 from findLE() expectedly.
+		reply.XIndex = rf.toIndex(offRes)
+		reply.XTerm = rf.termAtOffset(offRes)
 		return
 	}
 	
+
 	// Under unreliable networks, an old AppendEntries request may arrive
 	// after newer entries have already been accepted.
 	// A stale request may roll back entries that should not be removed,
 	// potentially including committed ones,
 	// which is catastrophic (broken Leadership Completeness)
 	// if this follower is to be elected as a new leader afterwards.
-	newLog := rf.log[:args.PrevLogIndex+1]
-	newLog = append(newLog, args.Entries...)
 
-	myLastTerm := rf.log[len(rf.log)-1].Term
-	newLastTerm := newLog[len(newLog)-1].Term
-	if newLastTerm < myLastTerm ||
-	   newLastTerm == myLastTerm && len(newLog) < len(rf.log) {
-			// Stale reuqest
-			// Mimic the election restriction: let only a newer log to overwrite mine.
-			return
-		}
-	rf.log = newLog
 	reply.Success = true
-	N := min(args.LeaderCommit, lastIndex(rf.log))
+	if len(args.Entries) != 0 {
+		myLastIndex := rf.lastLogIndex()
+		myLastTerm := lastTerm(rf.log)
+		newLastIndex := args.PrevLogIndex + indexT(len(args.Entries))
+		newLastTerm := lastTerm(args.Entries)
+		if newLastTerm < myLastTerm ||
+			newLastTerm == myLastTerm && newLastIndex < myLastIndex {
+				// Stage 2: Stale request
+				// Mimic the election restriction: let only a newer log to overwrite mine.
+				return
+			}
+		rf.log = append(rf.log[:off+1], args.Entries...)
+	}
+
+	N := min(args.LeaderCommit, rf.lastLogIndex())
 	if N > rf.commitIndex {
 		rf.commitIndex = N
 		testSend(rf.applyNotify, N)
@@ -121,6 +153,7 @@ func (rf *Raft) aeSender(server int, args *AppendEntriesArgs, ch chan bool) {
 		l := len(args.Entries)
 		newMatch := args.PrevLogIndex + indexT(l)
 		if (rf.matchIndex[server] >= newMatch) {
+			// Stage 2: Stale reply
 			// A successful reply may be stale under unreliable networks.
 			// Only move replication progress forward: never let an out-of-order
 			// old reply roll back matchIndex/nextIndex.
@@ -130,15 +163,18 @@ func (rf *Raft) aeSender(server int, args *AppendEntriesArgs, ch chan bool) {
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
 		rf.commit()
 	} else {
-		// consistency check failed
-		if rf.matchIndex[server] == lastIndex(rf.log) {
-			// Stale reply: this follower is already known to be fully caught up.
+		// Stage 1: consistency check failed
+		// In this stage, rf.matchIndex[server] == 0 and
+		// rf.nextIndex[server] always decrease.
+		if rf.matchIndex[server] != 0 {
+			// Stage 2:
+			// Stale reply: this follower has caught up with leader at least once
 			return
 		}
 		// fast backup
-		x := int(reply.XIndex)
+		x := rf.toOffset(reply.XIndex)
 		k := reply.XTerm
-		newNext := indexT(findLE(rf.log, x, k) + 1)
+		newNext := rf.toIndex(rf.findLE(x, k)) + 1
 		if rf.nextIndex[server] <= newNext {
 			// Stale reply: backup progress is up-to-date
 			return
@@ -149,41 +185,54 @@ func (rf *Raft) aeSender(server int, args *AppendEntriesArgs, ch chan bool) {
 }
 
 
-// AppendEntries RPC manager for `server`.
+// Heartbeat manager for `server`.
 // Goroutine listening on rf.aeChs[server].
-// Construct the args and limit the amount of AEs
-// sending to `server`.
-// Call aeSender to send AE and let it handle its own reply.
+// Construct the args and limit
+// the amount of heartbeats sending to `server`.
+// Call aeSender to send AE,
+// or call isSender to send IS
+// when rf.nextIndex[server] <= rf.snapshotIndex.
 // Return when killed (on a false signal)
-func (rf *Raft) aeWorker(server int) {
+func (rf *Raft) hbWorker(server int) {
 	ch := rf.aeChs[server]
 	for b := range(ch) {
 		if !b { return }
-		args := &AppendEntriesArgs{}
 		rf.mu.Lock()
 		if rf.state != Leader {
-			// must not send AEs with new term but as follower
+			// must not send heartbeats with new term but as follower
 			rf.mu.Unlock()
 			continue
 		}
 		term := rf.currentTerm
 		next := rf.nextIndex[server]
-
-		args.Term = term
-		args.LeaderId = rf.me
-		args.PrevLogIndex = next - 1
-		args.PrevLogTerm = rf.log[next - 1].Term
-		args.Entries = slices.Clone(rf.log[next:])
-		args.LeaderCommit = rf.commitIndex
-		rf.mu.Unlock()
-
-		go rf.aeSender(server, args, ch)
+		if next > rf.snapshotIndex {
+			args := &AppendEntriesArgs{
+				Term: term,
+				LeaderId: rf.me,
+				PrevLogIndex: next - 1,
+				PrevLogTerm: rf.termAtIndex(next - 1),
+				Entries: slices.Clone(rf.log[rf.toOffset(next):]),
+				LeaderCommit: rf.commitIndex,
+			}
+			rf.mu.Unlock()
+			go rf.aeSender(server, args, ch)
+		} else {
+			args := &InstallSnapshotArgs{
+				Term: term,
+				LeaderId: rf.me,
+				LastIncludedIndex: rf.snapshotIndex,
+				LastIncludedTerm: rf.snapshotTerm,
+				Data: slices.Clone(rf.snapshot),
+			}
+			rf.mu.Unlock()
+			go rf.isSender(server, args, ch)
+		}
 	}
 }
 
 
 // send true/false to all aeChs,
-// used to send heartbeats/AEs/kill signals
+// used to send heartbeats(AEs/ISs)/kill signals
 func (rf *Raft) broadcast(b bool) {
 	for i := 0; i < rf.n; i++ {
 		if i == int(rf.me) { continue }
@@ -200,7 +249,7 @@ func (rf *Raft) broadcast(b bool) {
 // On every signal received from rf.timer.C, 
 // send a heartbeat to all peers.
 // Guaranteed to return when killed.
-func (rf *Raft) aeTicker() {
+func (rf *Raft) hbTicker() {
 	for range(rf.timer.C) {
 		rf.broadcast(true)
 	}

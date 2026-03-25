@@ -37,9 +37,13 @@ const (
 )
 
 type (
-	indexT int
-	termT  int
-	idT    int
+	// indexT is the logical index of an entry in the Raft log, independent of log compaction.
+	indexT  int
+	// offsetT is a zero-based offset into rf.log, relative to the current in-memory log slice.
+	offsetT int
+
+	termT int
+	idT   int
 )
 
 type logEntry struct {
@@ -70,7 +74,6 @@ type Raft struct {
 	commitIndex indexT
 	lastApplied indexT
 
-
 	// volatile on leaders
 	nextIndex  []indexT
 	matchIndex []indexT
@@ -88,9 +91,21 @@ type Raft struct {
 	beats int // count of heartbeats from leader, zeroed each tick
 
 	// 3D: Snapshot
+	// persistent and protected by mu
 	snapshot      []byte
 	snapshotIndex indexT
 	snapshotTerm  termT
+
+// rf.applyMu serializes deliveries to applyCh and **exclusively** protects lastApplied.
+//
+// It is separated from the general rf.mu to avoid a potential deadlock:
+// the service layer, while handling messages from applyCh, may call rf.Snapshot(),
+// which attempts to acquire rf.mu. Meanwhile, the applier goroutine may hold rf.mu
+// and try to send on applyCh, creating a circular wait.
+//
+// By introducing applyMu, we decouple applyCh delivery from rf.mu,
+// ensuring that sending ApplyMsg does not block while holding rf.mu.
+	applyMu       sync.Mutex
 }
 
 // return currentTerm and whether this server
@@ -154,12 +169,12 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 	rf.snapshotTerm  = snapshotTerm
 
 	rf.snapshot = snapshot
+	rf.commitIndex = rf.snapshotIndex
+	rf.lastApplied = rf.snapshotIndex
 }
 
 // how many bytes in Raft's persisted log?
 func (rf *Raft) PersistBytes() int {
-	// ? I don't think mu.Lock() is needed
-	// ? What's this method for?
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.persister.RaftStateSize()
@@ -187,7 +202,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.mu.Unlock()
 		return -1, -1, false
 	}
-	index := len(rf.log)
+	index := rf.nextLogIndex()
 	term := rf.currentTerm
 	rf.log = append(rf.log, logEntry{
 		Command: command,
@@ -199,7 +214,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.timer.Reset()
 	rf.broadcast(true)
 	
-	return index, int(term), true
+	return int(index), int(term), true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -269,8 +284,8 @@ func (rf *Raft) bootInit() {
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
-	rf.snapshotIndex = 0
-	rf.snapshotTerm = 0
+	rf.snapshotIndex = -1
+	rf.snapshotTerm = -1
 	rf.snapshot = nil
 
 	rf.state = Follower
@@ -293,7 +308,7 @@ func (rf *Raft) goroutineInit() {
 	go rf.rvTicker()
 
 	// send heartbeats when it's leader
-	go rf.aeTicker()
+	go rf.hbTicker()
 
 	// wait for new elections
 	go rf.toCandidate()
@@ -303,38 +318,38 @@ func (rf *Raft) goroutineInit() {
 	for i := 0; i < rf.n; i++ {
 		if i == int(rf.me) { continue }
 		rf.aeChs[i] = make(chan bool, 4)
-		go rf.aeWorker(i)
+		go rf.hbWorker(i)
 	}
 }
 
 
 // Goroutine listening on applyNotify
 // Applies newly committed entries to applyCh
-// (assume applyCh to be very congested)
 // Return when killed
 func (rf *Raft) applier() {
 	for i := range(rf.applyNotify) {
 		if i == -1 { return }
 		rf.mu.Lock()
+		rf.applyMu.Lock()
 		i = rf.commitIndex
-		if i <= rf.lastApplied {
+		j := rf.lastApplied
+		if j >= i {
+			// rf.lastApplied > rf.commitIndex may not be possible
+			rf.applyMu.Unlock()
 			rf.mu.Unlock()
 			continue
 		}
-		log := slices.Clone(rf.log[rf.lastApplied+1 : i+1])
+		log := slices.Clone(rf.log[rf.toOffset(j+1) : rf.toOffset(i+1)])
 		rf.mu.Unlock()
 		for k, e := range log {
-			// assume applyCh to be very congested
 			rf.applyCh <- raftapi.ApplyMsg{
 				CommandValid: true,
 				Command: e.Command,
-				CommandIndex: k + int(rf.lastApplied + 1),
+				CommandIndex: k + int(j + 1),
 			}
 		}
-		rf.mu.Lock()
-		// Raft.String() also use it
-		rf.lastApplied = i 
-		rf.mu.Unlock()
+		rf.lastApplied = i
+		rf.applyMu.Unlock()
 	}
 }
 
@@ -342,16 +357,17 @@ func (rf *Raft) applier() {
 // calculate new commitIndex.
 // caller must hold mu.
 func (rf *Raft) commit() {
-	rf.matchIndex[rf.me] = lastIndex(rf.log) // COUNT YOURSELF!
+	rf.matchIndex[rf.me] = rf.lastLogIndex() // COUNT YOURSELF!
 	N := median(rf.matchIndex)
-	if N > rf.commitIndex && rf.log[N].Term == rf.currentTerm {
+	if N > rf.commitIndex && rf.termAtIndex(N) == rf.currentTerm {
 		rf.commitIndex = N
 		testSend(rf.applyNotify, N)
 	}
 }
 
-// Callers: AppendEntries(), RequestVote(), 
-// toCandidate(), aeSender().
+// Callers:
+// AppendEntries(), RequestVote(), InstallSnapshot(),
+// toCandidate(), aeSender(), isSender().
 // Cease to send heartbeat.
 // Caller must hold mu.
 func (rf *Raft) toFollower(term termT) {

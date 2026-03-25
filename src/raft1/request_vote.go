@@ -54,8 +54,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	// election restriction
-	myLastIndex := lastIndex(rf.log)
-	myLastTerm := rf.log[myLastIndex].Term
+	myLastIndex := rf.lastLogIndex()
+	myLastTerm := rf.termAtIndex(myLastIndex)
 	if args.LastLogTerm < myLastTerm  {
 		return
 	}
@@ -134,12 +134,12 @@ func (rf *Raft) toCandidate() {
 		rf.persist()
 
 		// prepare args
-		lastLogIndex := lastIndex(rf.log)
+		lastLogIndex := rf.lastLogIndex()
 		args := RequestVoteArgs{
 			Term: term,
 			CandidateId: rf.me,
 			LastLogIndex: lastLogIndex,
-			LastLogTerm: rf.log[lastLogIndex].Term,
+			LastLogTerm: rf.termAtIndex(lastLogIndex),
 		}
 		rf.mu.Unlock()
 
@@ -202,7 +202,7 @@ func (rf *Raft) toLeader(term termT) {
 	rf.state = Leader
 	
 	for i := 0; i < rf.n; i++ {
-		rf.nextIndex[i] = indexT(len(rf.log))
+		rf.nextIndex[i] = rf.nextLogIndex()
 		rf.matchIndex[i] = 0 // match at index 0
 	}
 
