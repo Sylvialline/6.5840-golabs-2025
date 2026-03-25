@@ -94,43 +94,44 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.beats++
 	reply.Term = rf.currentTerm
 
-	if args.LastIncludedIndex <= rf.snapshotIndex {
-		// Stale request: snapshot through this index already installed
+	rf.applyMu.Lock()
+
+	index := args.LastIncludedIndex
+	if index <= rf.lastApplied {
+		// Stale request: entries up through this index already applied.
 		// Also, this case may be caused by a dropped IS reply, in which case
 		// the leader should catch up the progress lost by that reply (update nextIndex).
+		rf.applyMu.Unlock()
 		rf.persist()
 		rf.mu.Unlock()
 		return
 	}
 
-	truncSize := int(args.LastIncludedIndex - rf.snapshotIndex)
-	rf.snapshotIndex = args.LastIncludedIndex
+	truncSize := int(index - rf.snapshotIndex)
+	rf.snapshotIndex = index
 	rf.snapshotTerm = args.LastIncludedTerm
 	if truncSize > len(rf.log) {
 		rf.log = nil
 	} else {
 		rf.log = rf.log[truncSize:]
 	}
-	// rf.log = nil
 	rf.snapshot = args.Data
-	rf.commitIndex = rf.snapshotIndex
+	rf.persist()
+	
+	if rf.commitIndex < index {
+		rf.commitIndex = index
+	}
 	msg := raftapi.ApplyMsg{
 		SnapshotValid: true,
 		Snapshot: slices.Clone(rf.snapshot),
 		SnapshotIndex: int(rf.snapshotIndex),
 		SnapshotTerm: int(rf.snapshotTerm),
 	}
-	index := rf.snapshotIndex
-	rf.persist()
 	rf.mu.Unlock()
 
-	rf.applyMu.Lock()
-	defer rf.applyMu.Unlock()
-	if rf.lastApplied >= index {
-		return
-	}
 	rf.applyCh <- msg
 	rf.lastApplied = index
+	rf.applyMu.Unlock()
 }
 
 // Goroutine that send an InstallSnapshot to server

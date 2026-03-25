@@ -159,7 +159,7 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 	   d.Decode(&votedFor)      != nil ||
 		 d.Decode(&log)           != nil ||
 		 d.Decode(&snapshotIndex) != nil ||
-		 d.Decode(&snapshotTerm)  != nil{
+		 d.Decode(&snapshotTerm)  != nil {
 		panic("readPersist: decode error")
 	}
 	rf.currentTerm = currentTerm
@@ -168,9 +168,11 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 	rf.snapshotIndex = snapshotIndex
 	rf.snapshotTerm  = snapshotTerm
 
-	rf.snapshot = snapshot
-	rf.commitIndex = rf.snapshotIndex
-	rf.lastApplied = rf.snapshotIndex
+	if rf.snapshotIndex != -1 {
+		rf.snapshot = snapshot
+		rf.commitIndex = rf.snapshotIndex
+		rf.lastApplied = rf.snapshotIndex
+	}
 }
 
 // how many bytes in Raft's persisted log?
