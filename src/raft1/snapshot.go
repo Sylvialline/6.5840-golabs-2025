@@ -1,11 +1,5 @@
 package raft
 
-import (
-	"slices"
-
-	"6.5840/raftapi"
-)
-
 // Helpers for working with logical log indexes and offsets.
 // Caller must hold rf.mu.
 
@@ -83,10 +77,10 @@ type InstallSnapshotReply struct {
 // InstallSnapshot RPC handler.
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
 		return
 	}
 	
@@ -94,16 +88,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.beats++
 	reply.Term = rf.currentTerm
 
-	rf.applyMu.Lock()
+	defer rf.persist()
 
 	index := args.LastIncludedIndex
-	if index <= rf.lastApplied {
-		// Stale request: entries up through this index already applied.
+	if index <= rf.commitIndex {
+		// Stale request: entries up through this index already committed
+		// and will be enventually applied to the service.
 		// Also, this case may be caused by a dropped IS reply, in which case
 		// the leader should catch up the progress lost by that reply (update nextIndex).
-		rf.applyMu.Unlock()
-		rf.persist()
-		rf.mu.Unlock()
 		return
 	}
 
@@ -116,22 +108,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.log = rf.log[truncSize:]
 	}
 	rf.snapshot = args.Data
-	rf.persist()
 	
 	if rf.commitIndex < index {
 		rf.commitIndex = index
+		testSend(rf.applyNotify, index)
 	}
-	msg := raftapi.ApplyMsg{
-		SnapshotValid: true,
-		Snapshot: slices.Clone(rf.snapshot),
-		SnapshotIndex: int(rf.snapshotIndex),
-		SnapshotTerm: int(rf.snapshotTerm),
-	}
-	rf.mu.Unlock()
 
-	rf.applyCh <- msg
-	rf.lastApplied = index
-	rf.applyMu.Unlock()
 }
 
 // Goroutine that send an InstallSnapshot to server

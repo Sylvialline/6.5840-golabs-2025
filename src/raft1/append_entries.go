@@ -2,62 +2,81 @@ package raft
 
 import "slices"
 
-// Log replication for each follower proceeds in three stages.
+// Log replication for a follower proceeds in three stages once
+// snapshots are introduced, since catching up a lagging follower is
+// no longer just a matter of sending missing log entries.
 //
 // The discussion below assumes the leader stays in the same term.
-// If the term changes, a new leader will reinitialize nextIndex and
-// matchIndex, and the process simply restarts from the beginning.
+// If the term changes, the new leader reinitializes nextIndex and
+// matchIndex for every follower, and the whole process restarts.
 //
 // Stage 1: fast backup.
 // The goal of this stage is to quickly find the highest log index
 // that still matches between leader and follower. During this stage,
 // matchIndex remains 0, while nextIndex keeps decreasing until the
-// first successful match is found. The leader then sends all entries
-// after that point and updates matchIndex. Once matchIndex has been
-// advanced successfully, this follower will not return to Stage 1
-// again in the same leader term.
+// first matching index is found. The leader then sends the entries
+// after that index and updates matchIndex. Once matchIndex has been
+// advanced successfully, the follower will never return to Stage 1
+// again within the same leader term, even if the follower restarts.
 //
 // Stage 2: keeping up.
 // After matchIndex has been updated at least once, replication enters
-// Stage 2. From this point on, nextIndex is expected to keep pointing
-// to the follower's next missing entry, except that it may lag behind
-// the follower's actual state if some replies are lost. Since leader
-// and follower already agree on the prefix, a normal AppendEntries
-// usually succeeds directly and keeps the follower caught up as the
-// leader appends new log entries. If log compaction later moves the
-// snapshot boundary past nextIndex, replication must enter Stage 3.
+// Stage 2. In this stage, nextIndex is expected to keep pointing to
+// the next entry the follower needs, except that it may lag behind
+// the follower's actual state when RPC replies are lost. From this
+// point on, leader and follower already agree on the prefix, so a
+// single AppendEntries RPC is usually enough to synchronize newly
+// appended log entries. If log compaction later moves snapshotIndex
+// past nextIndex, replication must enter Stage 3.
 //
 // Stage 3: snapshot installation.
-// If nextIndex falls behind snapshotIndex, the leader can no longer
-// send the missing prefix through AppendEntries and must send an
-// InstallSnapshot RPC instead. This can happen in Stage 1, when fast
-// backup discovers that none of the leader's remaining log entries
-// match the follower, or in Stage 2, when communication problems keep
-// nextIndex from being advanced while the service creates a snapshot
-// beyond it. Note that nextIndex is only the leader's belief about the
-// follower's progress, and may be smaller than the follower's actual
-// last log index when replies have been dropped.
+// If nextIndex falls below snapshotIndex in either Stage 1 or Stage 2,
+// the leader sends InstallSnapshot directly.
+//   - From Stage 1: fast backup has determined that none of the
+//     leader's remaining log entries can match the follower.
+//   - From Stage 2: communication problems prevent nextIndex from
+//     being updated in time, while the service has already created a
+//     snapshot beyond it.
+// Note that nextIndex (in stage 2) is only the leader's belief about
+// the follower's progress; when replies are dropped, it does not
+// necessarily point to the follower's actual log end.
 //
 // A follower accepts an incoming snapshot only if its snapshot index
-// is greater than lastApplied, rather than merely greater than the
-// follower's current snapshotIndex. Applying a snapshot overwrites the
-// service state through applyCh; accepting an older snapshot would
-// roll back service progress, and later log application could skip
-// entries in the middle, causing out-of-order apply errors.
+// is greater than commitIndex, and then advances commitIndex to that
+// snapshot index. Here commitIndex serves as a lower bound on the
+// follower's replication progress: by Raft's safety properties, all
+// log entries up through commitIndex already agree with the leader.
+// Therefore, installing a snapshot at or below commitIndex provides
+// no new synchronization information and should be rejected as stale.
+// This also prevents the follower from accepting a stale
+// InstallSnapshot request that survives only because earlier replies
+// were dropped.
 //
-// When a snapshot is accepted, the follower discards only the covered
-// prefix of its log and keeps the remaining suffix, if any. The
-// remaining suffix may or may not still be valid. If Stage 3 was
-// entered from Stage 1, the suffix is just unmatched leftover data
-// skipped during fast backup and will be removed by the next valid
-// AppendEntries. If Stage 3 was entered from Stage 2, the suffix may
-// still be valid, typically because dropped replies made nextIndex
-// stale on the leader side. In that case it must not be cleared
-// blindly, otherwise replication progress may be rolled back and
-// lastApplied or commitIndex may end up pointing into missing entries.
+// When a snapshot is accepted, this implementation discards only the
+// prefix of rf.log covered by the snapshot and keeps the remaining
+// suffix, if any. The remaining suffix may or may not still be valid.
+// If Stage 3 was entered from Stage 1, the suffix consists of invalid
+// leftover entries skipped during fast backup, and will be removed by
+// the next valid AppendEntries. If Stage 3 was entered from Stage 2,
+// the suffix may still be valid: dropped replies may have made the
+// leader's nextIndex smaller than the follower's actual progress.
+// Such a suffix must not be cleared blindly, otherwise replication
+// progress may be rolled back, and rf.lastApplied or rf.commitIndex
+// may end up pointing to missing log entries.
 //
-// Successful snapshot installation also advances matchIndex.
-
+// Progress direction in log replication.
+// The leader uses nextIndex and matchIndex together to represent a
+// follower's replication progress. Since progress must never go
+// backward, its meaning should be stated explicitly in each stage.
+//
+// In Stage 1, the leader has not yet synchronized successfully with
+// the follower, so matchIndex remains 0. Here nextIndex means that
+// follower entries with indexes greater than or equal to nextIndex
+// have been ruled out as matching the leader log, so progress is made
+// by decreasing nextIndex.
+//
+// In Stage 2 and Stage 3, matchIndex = nextIndex - 1 always holds, and
+// both values advance monotonically as replication progresses.
 
 type AppendEntriesArgs struct {
 	Term termT
@@ -165,7 +184,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Success = true
 	myLastIndex := rf.lastLogIndex()
-	myLastTerm := lastTerm(rf.log)
+	myLastTerm := rf.termAtIndex(myLastIndex)
 	var newLastIndex indexT
 	var newLastTerm termT
 	if len(args.Entries) != 0 {

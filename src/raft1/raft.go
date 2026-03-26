@@ -72,7 +72,7 @@ type Raft struct {
 
 	// volatile on all
 	commitIndex indexT
-	lastApplied indexT
+	lastApplied indexT // owned by applier()
 
 	// volatile on leaders
 	nextIndex  []indexT
@@ -81,7 +81,7 @@ type Raft struct {
 	// 3A & 3B
 	// not protected by mu
 	n           int // number of peers
-	candidateCh chan termT // buffer size = 1 makes the most sense
+	candidateCh chan termT
 	timer *softtimer.SoftTimer 
 	applyNotify chan indexT
 	aeChs       []chan bool // false means killed
@@ -95,17 +95,6 @@ type Raft struct {
 	snapshot      []byte
 	snapshotIndex indexT
 	snapshotTerm  termT
-
-// rf.applyMu serializes deliveries to applyCh and **exclusively** protects lastApplied.
-//
-// It is separated from the general rf.mu to avoid a potential deadlock:
-// the service layer, while handling messages from applyCh, may call rf.Snapshot(),
-// which attempts to acquire rf.mu. Meanwhile, the applier goroutine may hold rf.mu
-// and try to send on applyCh, creating a circular wait.
-//
-// By introducing applyMu, we decouple applyCh delivery from rf.mu,
-// ensuring that sending ApplyMsg does not block while holding rf.mu.
-	applyMu       sync.Mutex
 }
 
 // return currentTerm and whether this server
@@ -325,38 +314,57 @@ func (rf *Raft) goroutineInit() {
 }
 
 
-// Goroutine listening on applyNotify
-// Applies newly committed entries to applyCh
-// Return when killed
+// Goroutine listening on rf.applyNotify, which
+// receives a signal whenever rf.commitIndex increases.
+// Applies newly committed entries to applyCh, and if the next entry
+// to be applied is covered by the snapshot, sends the snapshot.
+// Explicitly owns rf.lastApplied, so no locks are needed when using it.
+// Returns when killed.
 func (rf *Raft) applier() {
 	for i := range(rf.applyNotify) {
 		if i == -1 { return }
+		var log []logEntry
+		var msg *raftapi.ApplyMsg
+
 		rf.mu.Lock()
-		rf.applyMu.Lock()
 		i = rf.commitIndex
 		j := rf.lastApplied
 		if j >= i {
-			// rf.lastApplied > rf.commitIndex may not be possible
-			rf.applyMu.Unlock()
+			if j > i { panic("rf.lastApplied > rf.commitIndex") }
 			rf.mu.Unlock()
 			continue
 		}
-		log := slices.Clone(rf.log[rf.toOffset(j+1) : rf.toOffset(i+1)])
-		rf.mu.Unlock()
-		for k, e := range log {
-			rf.applyCh <- raftapi.ApplyMsg{
-				CommandValid: true,
-				Command: e.Command,
-				CommandIndex: k + int(j + 1),
+		l, r := rf.toOffset(j+1), rf.toOffset(i+1)
+		if l < 0 {
+			msg = &raftapi.ApplyMsg{
+				SnapshotValid: true,
+				Snapshot: slices.Clone(rf.snapshot),
+				SnapshotIndex: int(rf.snapshotIndex),
+				SnapshotTerm: int(rf.snapshotTerm),
 			}
+		} else {
+			log = slices.Clone(rf.log[l : r])
 		}
-		rf.lastApplied = i
-		rf.applyMu.Unlock()
+		rf.mu.Unlock()
+
+		if log != nil {
+			for k, e := range log {
+				rf.applyCh <- raftapi.ApplyMsg{
+					CommandValid: true,
+					Command: e.Command,
+					CommandIndex: k + int(j + 1),
+				}
+			}
+			rf.lastApplied = i
+		} else {
+			rf.applyCh <- *msg
+			rf.lastApplied = indexT(msg.SnapshotIndex)
+		}
 	}
 }
 
-// called by leader.
-// calculate new commitIndex.
+// called by leader whenever rf.matchIndex[anyServer] increses.
+// calculate new rf.commitIndex.
 // caller must hold mu.
 func (rf *Raft) commit() {
 	rf.matchIndex[rf.me] = rf.lastLogIndex() // COUNT YOURSELF!
@@ -372,6 +380,7 @@ func (rf *Raft) commit() {
 // toCandidate(), aeSender(), isSender().
 // Cease to send heartbeat.
 // Caller must hold mu.
+// Caller must call rf.persist() after this.
 func (rf *Raft) toFollower(term termT) {
 
 	rf.state = Follower
